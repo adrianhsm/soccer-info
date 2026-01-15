@@ -1,0 +1,6 @@
+name = "soccer-info-worker"
+main = "src/index.js"
+compatibility_date = "2023-10-02"
+
+[vars]
+# Environment variables can go here

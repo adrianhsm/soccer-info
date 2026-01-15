@@ -1,0 +1,14 @@
+{
+  "name": "soccer-info-worker",
+  "version": "1.0.0",
+  "description": "Soccer Info Query Interface on Cloudflare Workers",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
