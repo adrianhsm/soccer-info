@@ -217,11 +217,15 @@ export default {
                 });
             }
 
-            const query = url.searchParams.get('q')?.toLowerCase() || 'yingchao';
-            const startDate = url.searchParams.get('start'); // e.g., 2026-01-15
-            const endDate = url.searchParams.get('end');     // e.g., 2026-01-20
+            const query = url.searchParams.get('q')?.toLowerCase() || '';
+            const leagueParam = url.searchParams.get('league')?.toLowerCase() || '';
+            const startDate = url.searchParams.get('start');
+            const endDate = url.searchParams.get('end');
+            const page = parseInt(url.searchParams.get('page') || '1');
+            const pageSize = parseInt(url.searchParams.get('pageSize') || '20');
+            const offset = (page - 1) * pageSize;
 
-            // Mapping logic for Juhe leagues (query -> type)
+            // Mapping logic for Juhe leagues
             const leagueMapping = {
                 'premier league': 'yingchao',
                 'la liga': 'xijia',
@@ -238,7 +242,6 @@ export default {
                 'zhongchao': 'zhongchao'
             };
 
-            // Mapping Juhe type to the title string returned by API (to filter DB)
             const typeToTitle = {
                 'yingchao': '英格兰超级联赛',
                 'xijia': '西班牙甲级联赛',
@@ -249,30 +252,35 @@ export default {
                 'jiangsu': '苏格兰超级联赛'
             };
 
-            const type = leagueMapping[query] || query;
-            const title = typeToTitle[type] || query;
+            const targetLeague = leagueParam || query || 'yingchao';
+            const type = leagueMapping[targetLeague] || targetLeague;
+            const title = typeToTitle[type] || targetLeague;
 
             try {
-                let sql = "SELECT * FROM juhe_matches WHERE league LIKE ? ";
+                let whereClause = "WHERE league LIKE ? ";
                 const params = [`%${title}%`];
 
                 if (startDate) {
-                    sql += " AND match_time >= ? ";
+                    whereClause += " AND match_time >= ? ";
                     params.push(startDate);
                 }
                 if (endDate) {
-                    // To include the whole end day, we could use < date + 1 day, or just >= and <=
-                    // But since match_time is ISO string, we'll do >= start and <= end + 'T23:59:59Z'
-                    sql += " AND match_time <= ? ";
+                    whereClause += " AND match_time <= ? ";
                     params.push(endDate + "T23:59:59Z");
                 }
 
-                sql += " ORDER BY match_time ASC LIMIT 100";
+                // Get total count for pagination metadata
+                const countSql = `SELECT COUNT(*) as total FROM juhe_matches ${whereClause}`;
+                const { results: countResults } = await env.DB.prepare(countSql).bind(...params).all();
+                let total = countResults[0].total;
 
-                let { results } = await env.DB.prepare(sql).bind(...params).all();
+                let sql = `SELECT * FROM juhe_matches ${whereClause} ORDER BY match_time ASC LIMIT ? OFFSET ?`;
+                const queryParams = [...params, pageSize, offset];
+
+                let { results } = await env.DB.prepare(sql).bind(...queryParams).all();
 
                 // If DB is empty for this league, try a live sync once
-                if (results.length === 0) {
+                if (results.length === 0 && page === 1) {
                     console.log(`DB empty for ${title}, triggering live sync...`);
                     const juheKey = env.JUHE_API_KEY;
                     const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`);
@@ -296,12 +304,22 @@ export default {
                         });
                         await saveMatchesToDb(env, syncMatches, 'juhe_matches');
                         // Re-query after sync
-                        const { results: retryResults } = await env.DB.prepare(sql).bind(...params).all();
+                        const { results: retryResults } = await env.DB.prepare(sql).bind(...queryParams).all();
                         results = retryResults;
+
+                        // Re-fetch total if needed, but for simplicity we assume sync succeeded
+                        const { results: retryCountResults } = await env.DB.prepare(countSql).bind(...params).all();
+                        total = retryCountResults[0].total;
                     }
                 }
 
                 return new Response(JSON.stringify({
+                    metadata: {
+                        total,
+                        page,
+                        pageSize,
+                        totalPages: Math.ceil(total / pageSize)
+                    },
                     leagues: [],
                     players: [],
                     matches: results.map(r => ({
@@ -319,6 +337,200 @@ export default {
                 });
             } catch (e) {
                 console.error('DB query error:', e);
+                return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/predict') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            let body = {};
+            if (request.method === 'POST') {
+                try {
+                    body = await request.json();
+                } catch (e) {
+                    return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+                        status: 400,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                }
+            } else {
+                body = {
+                    user_id: url.searchParams.get('user_id'),
+                    homeTeam: url.searchParams.get('homeTeam'),
+                    awayTeam: url.searchParams.get('awayTeam'),
+                    matchTime: url.searchParams.get('matchTime'),
+                    extraInfo: url.searchParams.get('extraInfo')
+                };
+            }
+
+            const { user_id, homeTeam, awayTeam, matchTime, extraInfo } = body;
+
+            if (!user_id || !homeTeam || !awayTeam) {
+                return new Response(JSON.stringify({ error: 'user_id, homeTeam and awayTeam are required' }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            if (!env.QWEN_API_KEY) {
+                return new Response(JSON.stringify({ error: 'QWEN_API_KEY not configured' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            const prompt = `
+你是一个专业的足球数据分析专家。请根据以下比赛信息进行详细活跃的分析，并提供胜负预测和可能的3个比分。
+
+**重要指令**：
+1. 请务必检索并使用截至比赛日期前最新的球队信息（包括但不限于球员转会、伤病、教练更迭、近期战绩等）。
+2. 请核实当前的球员名单和主教练情况，严禁引用已经离队或卸任的人员作为当前分析依据（例如：某球员已转会至他队，分析中不得说其仍在原队效力）。
+3. 分析应体现专业性，若对某些最新动态不确定，请优先检索实时数据或说明基于当前已知最前线的信息。
+
+比赛信息：
+- 主队：${homeTeam}
+- 客队：${awayTeam}
+- 比赛时间：${matchTime || '未提供'}
+- 额外信息：${extraInfo || '无'}
+- 当前系统参考时间：${new Date().toISOString().split('T')[0]}
+
+请提供：
+1. **详细分析**：包括两队近况、伤病、历史战绩等方面的综合评估。
+2. **胜负预测**：给出明确的胜、平、负倾向及理由。
+3. **可能的3个比分**：按可能性从高到低排列。
+
+请以JSON格式返回结果，结构如下：
+{
+  "analysis": "这里是详细分析内容...",
+  "prediction": "主胜/平局/客胜",
+  "prediction_reason": "理由...",
+  "possible_scores": ["2-1", "1-1", "2-0"]
+}
+`;
+
+            try {
+                const aiResponse = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${env.QWEN_API_KEY}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        model: 'qwen3-max',
+                        messages: [
+                            { role: 'system', content: 'You are a helpful assistant that provides professional soccer match analysis in JSON format.' },
+                            { role: 'user', content: prompt }
+                        ],
+                        response_format: { type: 'json_object' }
+                    })
+                });
+
+                if (!aiResponse.ok) {
+                    const error = await aiResponse.text();
+                    console.error('Qwen API Error:', error);
+                    return new Response(JSON.stringify({ error: 'Failed to fetch prediction from Qwen API' }), {
+                        status: 502,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                }
+
+                const aiData = await aiResponse.json();
+                const content = aiData.choices[0].message.content;
+                const result = JSON.parse(content);
+
+                // Store in DB
+                try {
+                    await env.DB.prepare(`
+                        INSERT INTO predictions (user_id, home_team, away_team, match_time, extra_info, analysis, prediction, prediction_reason, possible_scores)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `).bind(
+                        user_id,
+                        homeTeam,
+                        awayTeam,
+                        matchTime || '',
+                        extraInfo || '',
+                        result.analysis,
+                        result.prediction,
+                        result.prediction_reason,
+                        JSON.stringify(result.possible_scores)
+                    ).run();
+                } catch (dbError) {
+                    console.error('Failed to store prediction:', dbError);
+                    // We still return the result even if storage fails
+                }
+
+                return new Response(content, {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Prediction Error:', e);
+                return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/predict/history') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            const user_id = url.searchParams.get('user_id');
+            const page = parseInt(url.searchParams.get('page') || '1');
+            const pageSize = parseInt(url.searchParams.get('pageSize') || '20');
+            const offset = (page - 1) * pageSize;
+
+            if (!user_id) {
+                return new Response(JSON.stringify({ error: 'user_id is required' }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            try {
+                // Get total count
+                const { results: countResults } = await env.DB.prepare("SELECT COUNT(*) as total FROM predictions WHERE user_id = ?").bind(user_id).all();
+                const total = countResults[0].total;
+
+                // Get history ordered by match_time ASC
+                const { results } = await env.DB.prepare(`
+                    SELECT * FROM predictions 
+                    WHERE user_id = ? 
+                    ORDER BY match_time ASC 
+                    LIMIT ? OFFSET ?
+                `).bind(user_id, pageSize, offset).all();
+
+                return new Response(JSON.stringify({
+                    metadata: {
+                        total,
+                        page,
+                        pageSize,
+                        totalPages: Math.ceil(total / pageSize)
+                    },
+                    history: results.map(r => ({
+                        ...r,
+                        possible_scores: JSON.parse(r.possible_scores || '[]')
+                    }))
+                }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('History Query Error:', e);
                 return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
                     status: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }

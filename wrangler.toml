@@ -7,9 +7,10 @@ compatibility_date = "2023-10-02"
 API_KEY = "a8272bab12c11e8e00ca15101b054af7"
 API_SECRET = "a8272bab12c11e8e00ca15101b054af7"
 JUHE_API_KEY = "3ab88d882bc6bfc7876522e5d4312cdc"
+QWEN_API_KEY = "sk-5f2bab96bc824e509f361f033cc1ceba"
 
 [triggers]
-crons = ["*/30 * * * *"] # Every 30 minutes
+crons = ["0 */3 * * *"] # Every 3 hours starting from midnight
 
 [[d1_databases]]
 binding = "DB"
