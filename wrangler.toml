@@ -4,3 +4,14 @@ compatibility_date = "2023-10-02"
 
 [vars]
 # Environment variables can go here
+API_KEY = "a8272bab12c11e8e00ca15101b054af7"
+API_SECRET = "a8272bab12c11e8e00ca15101b054af7"
+JUHE_API_KEY = "3ab88d882bc6bfc7876522e5d4312cdc"
+
+[triggers]
+crons = ["*/30 * * * *"] # Every 30 minutes
+
+[[d1_databases]]
+binding = "DB"
+database_name = "soccer-db"
+database_id = "4347ccc7-06d0-483c-8484-9431b967f158"
