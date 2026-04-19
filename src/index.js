@@ -122,11 +122,19 @@ const saveMatchesToDb = async (env, matchesData, tableName = 'matches') => {
 const syncJuheMatches = async (env) => {
     const juheKey = env.JUHE_API_KEY;
     const leagues = ['yingchao', 'xijia', 'dejia', 'yijia', 'fajia', 'zhongchao'];
+    const timeout = 120 * 1000;
 
     for (const type of leagues) {
         try {
             console.log(`Syncing Juhe league: ${type}`);
-            const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeout);
+            
+            const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`, {
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            
             const data = await response.json();
 
             if (data.error_code === 0 && data.result && data.result.matchs) {
@@ -159,7 +167,14 @@ const syncJuheMatches = async (env) => {
 
 const fetchRenjiuPeriods = async () => {
     try {
-        const response = await fetch('https://www.500.com/kaijiang/sfc/lskj/');
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 120 * 1000);
+        
+        const response = await fetch('https://www.500.com/kaijiang/sfc/lskj/', {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        
         if (!response.ok) return [];
         const html = await response.text();
         
@@ -184,7 +199,14 @@ const fetchRenjiuPeriods = async () => {
 
 const fetchRenjiuPeriodMatches = async (env, period) => {
     try {
-        const response = await fetch(`https://www.500.com/kaijiang/sfc/${period}.html`);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 120 * 1000);
+        
+        const response = await fetch(`https://www.500.com/kaijiang/sfc/${period}.html`, {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        
         if (!response.ok) return [];
         const html = await response.text();
         
@@ -326,7 +348,14 @@ const syncRenjiuMatches = async (env) => {
 
 const fetchLive500Matches = async () => {
     try {
-        const response = await fetch('https://live.500.com/wanchang.php');
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 120 * 1000);
+        
+        const response = await fetch('https://live.500.com/wanchang.php', {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        
         if (!response.ok) return [];
         
         const buffer = await response.arrayBuffer();
@@ -712,7 +741,14 @@ export default {
                 if (results.length === 0 && page === 1) {
                     console.log(`DB empty for ${title}, triggering live sync...`);
                     const juheKey = env.JUHE_API_KEY;
-                    const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`);
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 120 * 1000);
+                    
+                    const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`, {
+                        signal: controller.signal
+                    });
+                    clearTimeout(timeoutId);
+                    
                     const data = await response.json();
 
                     if (data.error_code === 0 && data.result && data.result.matchs) {
