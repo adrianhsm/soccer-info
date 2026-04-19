@@ -335,20 +335,30 @@ const fetchLive500Matches = async () => {
         
         const matches = [];
         
-        const matchRegex = /<td[^>]*class=["'][^"']*bifen[^"']*["'][^>]*>.*?<a[^>]*>([^<]*)<\/a>.*?vs.*?<a[^>]*>([^<]*)<\/a>.*?<td[^>]*class=["'][^"']*bf[^"']*["'][^>]*>.*?<span[^>]*>([^<]*)<\/span>/g;
-        let match;
+        const trRegex = /<tr[^>]*gy=["']([^"']*)["'][^>]*>([\s\S]*?)<\/tr>/g;
+        let trMatch;
         
-        while ((match = matchRegex.exec(html)) !== null) {
-            const homeTeam = match[1].trim();
-            const awayTeam = match[2].trim();
-            const score = match[3].trim();
+        while ((trMatch = trRegex.exec(html)) !== null) {
+            const gyInfo = trMatch[1];
+            const trContent = trMatch[2];
             
-            if (homeTeam && awayTeam && score && score.includes('-')) {
-                matches.push({
-                    home: homeTeam,
-                    away: awayTeam,
-                    score: score
-                });
+            const homeMatch = trContent.match(/<span class="mainName"[^>]*>([^<]*)<\/span>/);
+            const awayMatch = trContent.match(/<span class="clientName"[^>]*>([^<]*)<\/span>/);
+            
+            const scoreMatch = trContent.match(/<td[^>]*class="red"[^>]*>([\d\s-]+)<\/td>/);
+            
+            if (homeMatch && awayMatch && scoreMatch) {
+                const homeTeam = homeMatch[1].trim();
+                const awayTeam = awayMatch[1].trim();
+                const score = scoreMatch[1].trim();
+                
+                if (homeTeam && awayTeam && score && score.match(/\d+\s*-\s*\d+/)) {
+                    matches.push({
+                        home: homeTeam,
+                        away: awayTeam,
+                        score: score
+                    });
+                }
             }
         }
         
@@ -654,8 +664,30 @@ export default {
                     WHERE status != '完赛' AND match_time <= ?
                 `).bind(twoHoursAgo).run();
 
-                let whereClause = "WHERE league LIKE ? ";
-                const params = [`%${title}%`];
+                let whereClause = "";
+                const params = [];
+                
+                // Search by league if leagueParam is provided
+                if (leagueParam) {
+                    whereClause = "WHERE league LIKE ? ";
+                    params.push(`%${title}%`);
+                }
+                
+                // Search by team name if query is provided
+                if (query) {
+                    if (whereClause) {
+                        whereClause += " AND ";
+                    } else {
+                        whereClause = "WHERE ";
+                    }
+                    whereClause += "(home_team LIKE ? OR away_team LIKE ?)";
+                    params.push(`%${query}%`, `%${query}%`);
+                }
+                
+                if (!whereClause) {
+                    whereClause = "WHERE league LIKE ?";
+                    params.push(`%${title}%`);
+                }
 
                 if (startDate) {
                     whereClause += " AND match_time >= ? ";
@@ -1565,7 +1597,8 @@ export default {
             try {
                 console.log('Manual sync triggered for renjiu data...');
                 await syncRenjiuMatches(env);
-                return new Response(JSON.stringify({ message: 'Sync completed successfully' }), {
+                await supplementScoresFromLive500(env);
+                return new Response(JSON.stringify({ message: 'Sync and supplement completed successfully' }), {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
             } catch (e) {
