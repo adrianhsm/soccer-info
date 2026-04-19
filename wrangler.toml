@@ -10,7 +10,9 @@ JUHE_API_KEY = "3ab88d882bc6bfc7876522e5d4312cdc"
 QWEN_API_KEY = "sk-5f2bab96bc824e509f361f033cc1ceba"
 
 [triggers]
-crons = ["0 */3 * * *"] # Every 3 hours starting from midnight
+# Cron triggers managed via Cloudflare Dashboard
+# Suggested: 0 0 * * *, 20 4 * * *, 40 8 * * *, 0 12 * * *, 20 16 * * *
+crons = []
 
 [[d1_databases]]
 binding = "DB"

@@ -133,6 +133,10 @@ const syncJuheMatches = async (env) => {
                 const matches = [];
                 data.result.matchs.forEach(day => {
                     day.list.forEach(m => {
+                        const score1 = m.team1_score || '-';
+                        const score2 = m.team2_score || '-';
+                        const score = `${score1} - ${score2}`;
+                        
                         matches.push({
                             home: m.team1,
                             away: m.team2,
@@ -140,7 +144,7 @@ const syncJuheMatches = async (env) => {
                             away_logo: m.team2_logo,
                             league: data.result.title,
                             date: `${day.date}T${m.time_start}:00Z`,
-                            score: `${m.team1_score} - ${m.team2_score}`,
+                            score: score,
                             status: m.status_text
                         });
                     });
@@ -153,15 +157,331 @@ const syncJuheMatches = async (env) => {
     }
 };
 
+const fetchRenjiuPeriods = async () => {
+    try {
+        const response = await fetch('https://www.500.com/kaijiang/sfc/lskj/');
+        if (!response.ok) return [];
+        const html = await response.text();
+        
+        const periodRegex = /"(\d{5})","(\d{4}-\d{2}-\d{2})","[^"]+"/g;
+        const periods = [];
+        let match;
+        
+        while ((match = periodRegex.exec(html)) !== null) {
+            const period = match[1];
+            if (period && !periods.includes(period)) {
+                periods.push(period);
+            }
+        }
+        
+        console.log(`Found ${periods.length} valid periods from HTML`);
+        return periods.sort((a, b) => b - a);
+    } catch (e) {
+        console.error('Error fetching renjiu periods:', e);
+        return [];
+    }
+};
+
+const fetchRenjiuPeriodMatches = async (env, period) => {
+    try {
+        const response = await fetch(`https://www.500.com/kaijiang/sfc/${period}.html`);
+        if (!response.ok) return [];
+        const html = await response.text();
+        
+        const matches = [];
+        
+        const teamnameTopRegex = /<div class="teamname teamname-top"[^>]*>[\s\S]*?<\/div>\s*<div class="vs"[^>]*>[\s\S]*?<\/div>\s*<div class="teamname"[^>]*>[\s\S]*?<\/div>/g;
+        const teamMatches = html.match(teamnameTopRegex) || [];
+        
+        const scoreRegex = /<td class="td-score"[^>]*><span[^>]*>([^<]+)<\/span><\/td>/g;
+        const scoreMatches = [...html.matchAll(scoreRegex)];
+        
+        for (let i = 0; i < teamMatches.length; i++) {
+            const teamBlock = teamMatches[i];
+            
+            const allDivs = teamBlock.match(/<div class="teamname[^"]*"[^>]*>([\s\S]*?)<\/div>/g);
+            
+            if (allDivs && allDivs.length >= 2) {
+                const cleanSpans = (divHtml) => {
+                    const chars = divHtml.match(/<span[^>]*>([^<]*)<\/span>/g) || [];
+                    return chars.map(s => s.replace(/<[^>]+>/g, '')).join('');
+                };
+                
+                const homeTeam = cleanSpans(allDivs[0]);
+                const awayTeam = cleanSpans(allDivs[1]);
+                
+                let score = '';
+                let status = '';
+                
+                if (scoreMatches[i]) {
+                    score = scoreMatches[i][1];
+                    if (score.includes('-')) {
+                        status = '已开奖';
+                    } else {
+                        status = '未开奖';
+                    }
+                }
+                
+                if (homeTeam && awayTeam) {
+                    matches.push({
+                        home_team: homeTeam,
+                        away_team: awayTeam,
+                        match_time: '',
+                        score: score,
+                        status: status,
+                        league: ''
+                    });
+                }
+            }
+        }
+        
+        return matches;
+    } catch (e) {
+        console.error(`Error fetching renjiu period ${period} matches:`, e);
+        return [];
+    }
+};
+
+const syncRenjiuMatches = async (env) => {
+    const teamVariantsMap = {
+        '曼彻斯特联': ['曼彻斯特联', '曼联'],
+        '曼彻斯特城': ['曼彻斯特城', '曼城'],
+        '纽卡斯尔联': ['纽卡斯尔联', '纽卡斯尔'],
+        '托特纳姆热刺': ['托特纳姆热刺', '热刺'],
+        '切尔西': ['切尔西'],
+        '阿森纳': ['阿森纳'],
+        '利物浦': ['利物浦'],
+        '曼联': ['曼彻斯特联', '曼联'],
+        '曼城': ['曼彻斯特城', '曼城']
+    };
+    
+    const periods = await fetchRenjiuPeriods();
+    console.log(`Found ${periods.length} renjiu periods`);
+    
+    for (const period of periods) {
+        const { results } = await env.DB.prepare("SELECT id FROM renjiu_periods WHERE period = ?").bind(period).all();
+        
+        if (results.length === 0) {
+            await env.DB.prepare("INSERT INTO renjiu_periods (period) VALUES (?)").bind(period).run();
+            console.log(`New period detected: ${period}, fetching matches...`);
+            
+            const matches = await fetchRenjiuPeriodMatches(env, period);
+            console.log(`Fetched ${matches.length} matches for period ${period}`);
+            
+            for (let i = 0; i < matches.length; i++) {
+                const m = matches[i];
+                await env.DB.prepare(`
+                    INSERT INTO renjiu_matches (period, match_index, home_team, away_team, match_time, score, status, league)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(period, match_index) DO UPDATE SET
+                        home_team = excluded.home_team,
+                        away_team = excluded.away_team,
+                        match_time = excluded.match_time,
+                        score = excluded.score,
+                        status = excluded.status,
+                        league = excluded.league
+                `).bind(period, i, m.home_team, m.away_team, m.match_time, m.score, m.status, m.league).run();
+                
+                const homeVariants = teamVariantsMap[m.home_team] || [m.home_team];
+                const awayVariants = teamVariantsMap[m.away_team] || [m.away_team];
+                
+                let matchedJuheMatch = null;
+                
+                for (const hVar of homeVariants) {
+                    for (const aVar of awayVariants) {
+                        const { results: juheMatches } = await env.DB.prepare(`
+                            SELECT id, match_time, home_team, away_team FROM juhe_matches 
+                            WHERE home_team LIKE ? AND away_team LIKE ?
+                            AND (period IS NULL OR period = '')
+                            LIMIT 5
+                        `).bind(`%${hVar}%`, `%${aVar}%`).all();
+                        
+                        for (const jm of juheMatches) {
+                            const jmHomeMatch = homeVariants.some(v => jm.home_team.includes(v) || v.includes(jm.home_team));
+                            const jmAwayMatch = awayVariants.some(v => jm.away_team.includes(v) || v.includes(jm.away_team));
+                            
+                            if (jmHomeMatch && jmAwayMatch) {
+                                matchedJuheMatch = jm;
+                                break;
+                            }
+                        }
+                        if (matchedJuheMatch) break;
+                    }
+                    if (matchedJuheMatch) break;
+                }
+                
+                if (matchedJuheMatch) {
+                    await env.DB.prepare(`
+                        UPDATE juhe_matches 
+                        SET period = ? 
+                        WHERE id = ?
+                    `).bind(period, matchedJuheMatch.id).run();
+                    console.log(`Linked juhe match ${matchedJuheMatch.home_team} vs ${matchedJuheMatch.away_team} to period ${period}`);
+                }
+            }
+            console.log(`Saved ${matches.length} matches for period ${period}`);
+        }
+    }
+};
+
+const fetchLive500Matches = async () => {
+    try {
+        const response = await fetch('https://live.500.com/wanchang.php');
+        if (!response.ok) return [];
+        
+        const buffer = await response.arrayBuffer();
+        const decoder = new TextDecoder('gbk');
+        const html = decoder.decode(buffer);
+        
+        const matches = [];
+        
+        const matchRegex = /<td[^>]*class=["'][^"']*bifen[^"']*["'][^>]*>.*?<a[^>]*>([^<]*)<\/a>.*?vs.*?<a[^>]*>([^<]*)<\/a>.*?<td[^>]*class=["'][^"']*bf[^"']*["'][^>]*>.*?<span[^>]*>([^<]*)<\/span>/g;
+        let match;
+        
+        while ((match = matchRegex.exec(html)) !== null) {
+            const homeTeam = match[1].trim();
+            const awayTeam = match[2].trim();
+            const score = match[3].trim();
+            
+            if (homeTeam && awayTeam && score && score.includes('-')) {
+                matches.push({
+                    home: homeTeam,
+                    away: awayTeam,
+                    score: score
+                });
+            }
+        }
+        
+        console.log(`Fetched ${matches.length} matches from live.500.com`);
+        return matches;
+    } catch (e) {
+        console.error('Error fetching live.500.com:', e);
+        return [];
+    }
+};
+
+const supplementScoresFromLive500 = async (env) => {
+    console.log('Supplementing scores from live.500.com...');
+    
+    const liveMatches = await fetchLive500Matches();
+    
+    if (liveMatches.length === 0) {
+        console.log('No matches found from live.500.com');
+        return;
+    }
+    
+    const { results: juheMatches } = await env.DB.prepare(`
+        SELECT id, home_team, away_team, score, match_time 
+        FROM juhe_matches 
+        WHERE score IS NULL OR score = '' OR score = '- -' OR score = '- - -'
+    `).all();
+    
+    console.log(`Found ${juheMatches.length} matches with missing scores`);
+    
+    let supplementedCount = 0;
+    
+    for (const match of juheMatches) {
+        for (const liveMatch of liveMatches) {
+            const homeMatch = match.home_team.includes(liveMatch.home) || liveMatch.home.includes(match.home_team);
+            const awayMatch = match.away_team.includes(liveMatch.away) || liveMatch.away.includes(match.away_team);
+            
+            if (homeMatch && awayMatch && liveMatch.score && liveMatch.score.includes('-')) {
+                await env.DB.prepare(`
+                    UPDATE juhe_matches 
+                    SET score = ? 
+                    WHERE id = ?
+                `).bind(liveMatch.score, match.id).run();
+                
+                console.log(`Supplemented score for ${match.home_team} vs ${match.away_team}: ${liveMatch.score}`);
+                supplementedCount++;
+                break;
+            }
+        }
+    }
+    
+    console.log(`Supplemented ${supplementedCount} scores from live.500.com`);
+};
+
+const getRenjiuScore = async (env, homeTeam, awayTeam, matchTime) => {
+    const teamVariants = {
+        '曼彻斯特联': ['曼彻斯特联', '曼联', '曼彻斯特联'],
+        '曼彻斯特城': ['曼彻斯特城', '曼城'],
+        '纽卡斯尔联': ['纽卡斯尔联', '纽卡斯尔'],
+        '托特纳姆热刺': ['托特纳姆热刺', '热刺'],
+        '曼彻斯特联': ['曼彻斯特联', '曼联']
+    };
+    
+    const homeVariants = teamVariants[homeTeam] || [homeTeam];
+    const awayVariants = teamVariants[awayTeam] || [awayTeam];
+    
+    const juheMatchTime = new Date(matchTime);
+    const timeDiff24h = 24 * 60 * 60 * 1000;
+    
+    for (const hVar of homeVariants) {
+        for (const aVar of awayVariants) {
+            const { results } = await env.DB.prepare(`
+                SELECT score, home_team, away_team, created_at FROM renjiu_matches 
+                WHERE (home_team = ? AND away_team = ?)
+                OR (home_team = ? AND away_team = ?)
+                AND score IS NOT NULL AND score != '' AND score != '-'
+                ORDER BY created_at DESC
+                LIMIT 10
+            `).bind(hVar, aVar, aVar, hVar).all();
+            
+            if (results.length > 0) {
+                for (const result of results) {
+                    const renjuHomeTeam = result.home_team;
+                    const renjuAwayTeam = result.away_team;
+                    
+                    const homeMatch = homeVariants.some(v => v === renjuHomeTeam || renjuHomeTeam.includes(v) || v.includes(renjuHomeTeam));
+                    const awayMatch = awayVariants.some(v => v === renjuAwayTeam || renjuAwayTeam.includes(v) || v.includes(renjuAwayTeam));
+                    
+                    if (homeMatch && awayMatch) {
+                        const renjuCreatedTime = new Date(result.created_at);
+                        const timeDiff = Math.abs(juheMatchTime.getTime() - renjuCreatedTime.getTime());
+                        const timeDiffHours = timeDiff / (1000 * 60 * 60);
+                        
+                        if (timeDiffHours <= 48) {
+                            console.log(`Found matching match within 48h: ${renjuHomeTeam} vs ${renjuAwayTeam}, time diff: ${timeDiffHours.toFixed(1)} hours`);
+                            return result.score;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    return null;
+};
+
+const normalizeTeamName = (teamName) => {
+    const normalizationMap = {
+        '曼彻斯特联': ['曼联', '曼彻斯特联', '曼联'],
+        '曼彻斯特城': ['曼城', '曼彻斯特城', '曼城'],
+        '纽卡斯尔联': ['纽卡斯尔', '纽卡斯尔联'],
+        '托特纳姆热刺': ['热刺', '托特纳姆热刺'],
+        '切尔西': ['切尔西'],
+        '阿森纳': ['阿森纳'],
+        '利物浦': ['利物浦'],
+        '曼彻斯特联': ['曼联', '曼彻斯特联']
+    };
+    
+    for (const [normalized, variants] of Object.entries(normalizationMap)) {
+        if (variants.includes(teamName)) {
+            return normalized;
+        }
+    }
+    return teamName;
+};
+
 export default {
-    // Cron Handler
     async scheduled(event, env, ctx) {
         console.log('Cron job started: Syncing matches...');
-        // Sync API-Football
         const matchesData = await fetchTodayMatches(env);
         await saveMatchesToDb(env, matchesData);
-        // Sync Juhe
         await syncJuheMatches(env);
+        await syncRenjiuMatches(env);
+        await supplementScoresFromLive500(env);
         console.log('Cron job completed.');
     },
 
@@ -390,6 +710,31 @@ export default {
                     }
                 }
 
+                const matchesWithSupplementedScores = await Promise.all(
+                    results.map(async (r) => {
+                        let score = r.score;
+                        
+                        if (score && (score === '- -' || score === '- - -' || !score.includes('-'))) {
+                            const supplementedScore = await getRenjiuScore(env, r.home_team, r.away_team, r.match_time);
+                            if (supplementedScore) {
+                                console.log(`Supplemented score for ${r.home_team} vs ${r.away_team}: ${supplementedScore}`);
+                                score = supplementedScore;
+                            }
+                        }
+                        
+                        return {
+                            home: r.home_team,
+                            away: r.away_team,
+                            home_logo: r.home_logo,
+                            away_logo: r.away_logo,
+                            league: r.league,
+                            date: r.match_time,
+                            score: score,
+                            status: r.status
+                        };
+                    })
+                );
+
                 return new Response(JSON.stringify({
                     metadata: {
                         total,
@@ -399,16 +744,7 @@ export default {
                     },
                     leagues: [],
                     players: [],
-                    matches: results.map(r => ({
-                        home: r.home_team,
-                        away: r.away_team,
-                        home_logo: r.home_logo,
-                        away_logo: r.away_logo,
-                        league: r.league,
-                        date: r.match_time,
-                        score: r.score,
-                        status: r.status
-                    }))
+                    matches: matchesWithSupplementedScores
                 }), {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
@@ -1194,6 +1530,113 @@ export default {
             }
         }
 
+        if (url.pathname === '/api/renjiu/periods') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            try {
+                const { results } = await env.DB.prepare("SELECT * FROM renjiu_periods ORDER BY period DESC").all();
+                return new Response(JSON.stringify({ periods: results }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Renjiu periods query error:', e);
+                return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/renjiu/sync') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            try {
+                console.log('Manual sync triggered for renjiu data...');
+                await syncRenjiuMatches(env);
+                return new Response(JSON.stringify({ message: 'Sync completed successfully' }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Renjiu sync error:', e);
+                return new Response(JSON.stringify({ error: 'Sync failed', details: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname.startsWith('/api/renjiu/matches/')) {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            const period = url.pathname.split('/').pop();
+            try {
+                const { results } = await env.DB.prepare("SELECT * FROM renjiu_matches WHERE period = ? ORDER BY match_index ASC").bind(period).all();
+                return new Response(JSON.stringify({ period, matches: results }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Renjiu matches query error:', e);
+                return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/renjiu/latest') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            try {
+                const { results: periods } = await env.DB.prepare("SELECT period FROM renjiu_periods ORDER BY CAST(period AS INTEGER) DESC LIMIT 1").all();
+                if (periods.length === 0) {
+                    return new Response(JSON.stringify({ error: 'No data found' }), {
+                        status: 404,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                }
+
+                const latestPeriod = periods[0].period;
+                const { results: matches } = await env.DB.prepare("SELECT * FROM renjiu_matches WHERE period = ? ORDER BY match_index ASC").bind(latestPeriod).all();
+
+                return new Response(JSON.stringify({ period: latestPeriod, matches }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Renjiu latest query error:', e);
+                return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
         return new Response('Not Found', { status: 404 });
     },
 };
+
+// Export functions for testing
+export { fetchRenjiuPeriods, fetchRenjiuPeriodMatches, syncRenjiuMatches };

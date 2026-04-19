@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS juhe_matches (
     status TEXT,
     home_logo TEXT,
     away_logo TEXT,
+    period TEXT,
     UNIQUE(home_team, away_team, match_time)
 );
 
@@ -38,3 +39,25 @@ CREATE TABLE IF NOT EXISTS predictions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_predictions_user_match_time ON predictions(user_id, match_time);
+
+CREATE TABLE IF NOT EXISTS renjiu_periods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS renjiu_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period TEXT NOT NULL,
+    match_index INTEGER NOT NULL,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    match_time TEXT,
+    score TEXT,
+    status TEXT,
+    league TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(period, match_index)
+);
+CREATE INDEX IF NOT EXISTS idx_renjiu_matches_period ON renjiu_matches(period);
+CREATE INDEX IF NOT EXISTS idx_renjiu_matches_teams ON renjiu_matches(home_team, away_team);
