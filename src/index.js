@@ -77,37 +77,21 @@ const saveMatchesToDb = async (env, matchesData, tableName = 'matches') => {
         const homeLogo = f.teams?.home?.logo || f.home_logo;
         const awayLogo = f.teams?.away?.logo || f.away_logo;
 
-        // 1. Update existing record if found within 24 hours (86400 seconds)
+        // Delete existing record within 24 hours and re-insert with new data
         queries.push(
             env.DB.prepare(`
-                UPDATE ${tableName}
-                SET match_time = ?, score = ?, status = ?, league = ?, home_logo = ?, away_logo = ?
-                WHERE id = (
-                    SELECT id FROM ${tableName}
-                    WHERE home_team = ? AND away_team = ? 
-                      AND abs(strftime('%s', match_time) - strftime('%s', ?)) <= 86400
-                    LIMIT 1
-                )
-            `).bind(time, score, status, league, homeLogo, awayLogo, home, away, time)
+                DELETE FROM ${tableName}
+                WHERE home_team = ? AND away_team = ?
+                  AND abs(strftime('%s', match_time) - strftime('%s', ?)) <= 86400
+            `).bind(home, away, time)
         );
 
-        // 2. Insert if not found, with standard ON CONFLICT fallback for safety
+        // Insert new record
         queries.push(
             env.DB.prepare(`
                 INSERT INTO ${tableName} (home_team, away_team, match_time, league, score, status, home_logo, away_logo)
-                SELECT ?, ?, ?, ?, ?, ?, ?, ?
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM ${tableName}
-                    WHERE home_team = ? AND away_team = ? 
-                      AND abs(strftime('%s', match_time) - strftime('%s', ?)) <= 86400
-                )
-                ON CONFLICT(home_team, away_team, match_time) DO UPDATE SET
-                    score = excluded.score,
-                    status = excluded.status,
-                    league = excluded.league,
-                    home_logo = excluded.home_logo,
-                    away_logo = excluded.away_logo
-            `).bind(home, away, time, league, score, status, homeLogo, awayLogo, home, away, time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind(home, away, time, league, score, status, homeLogo, awayLogo)
         );
     });
 
@@ -1631,14 +1615,15 @@ export default {
             }
 
             try {
-                console.log('Manual sync triggered for renjiu data...');
+                console.log('Manual sync triggered for all data...');
+                await syncJuheMatches(env);
                 await syncRenjiuMatches(env);
                 await supplementScoresFromLive500(env);
                 return new Response(JSON.stringify({ message: 'Sync and supplement completed successfully' }), {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
             } catch (e) {
-                console.error('Renjiu sync error:', e);
+                console.error('Sync error:', e);
                 return new Response(JSON.stringify({ error: 'Sync failed', details: e.message }), {
                     status: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
