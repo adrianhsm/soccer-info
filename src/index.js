@@ -103,48 +103,76 @@ const saveMatchesToDb = async (env, matchesData, tableName = 'matches') => {
     }
 };
 
+const getJuheApiKey = (env) => {
+    const keys = [
+        env.JUHE_API_KEY,
+        env.JUHE_API_KEY_2
+    ].filter(Boolean);
+    
+    return keys[0] || null;
+};
+
 const syncJuheMatches = async (env) => {
-    const juheKey = env.JUHE_API_KEY;
     const leagues = ['yingchao', 'xijia', 'dejia', 'yijia', 'fajia', 'zhongchao'];
     const timeout = 120 * 1000;
+    const keys = [
+        env.JUHE_API_KEY,
+        env.JUHE_API_KEY_2
+    ].filter(Boolean);
 
     for (const type of leagues) {
-        try {
-            console.log(`Syncing Juhe league: ${type}`);
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), timeout);
+        let success = false;
+        
+        for (const juheKey of keys) {
+            if (success) break;
             
-            const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`, {
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-            
-            const data = await response.json();
+            try {
+                console.log(`Syncing Juhe league: ${type} with key: ${juheKey.substring(0, 8)}...`);
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), timeout);
+                
+                const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`, {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                
+                const data = await response.json();
 
-            if (data.error_code === 0 && data.result && data.result.matchs) {
-                const matches = [];
-                data.result.matchs.forEach(day => {
-                    day.list.forEach(m => {
-                        const score1 = m.team1_score || '-';
-                        const score2 = m.team2_score || '-';
-                        const score = `${score1} - ${score2}`;
-                        
-                        matches.push({
-                            home: m.team1,
-                            away: m.team2,
-                            home_logo: m.team1_logo,
-                            away_logo: m.team2_logo,
-                            league: data.result.title,
-                            date: `${day.date}T${m.time_start}:00Z`,
-                            score: score,
-                            status: m.status_text
+                if (data.error_code === 0 && data.result && data.result.matchs) {
+                    const matches = [];
+                    data.result.matchs.forEach(day => {
+                        day.list.forEach(m => {
+                            const score1 = m.team1_score || '-';
+                            const score2 = m.team2_score || '-';
+                            const score = `${score1} - ${score2}`;
+                            
+                            matches.push({
+                                home: m.team1,
+                                away: m.team2,
+                                home_logo: m.team1_logo,
+                                away_logo: m.team2_logo,
+                                league: data.result.title,
+                                date: `${day.date}T${m.time_start}:00Z`,
+                                score: score,
+                                status: m.status_text
+                            });
                         });
                     });
-                });
-                await saveMatchesToDb(env, matches, 'juhe_matches');
+                    await saveMatchesToDb(env, matches, 'juhe_matches');
+                    success = true;
+                    console.log(`Successfully synced ${matches.length} matches for ${type}`);
+                } else if (data.error_code === 10012) {
+                    console.log(`API key ${juheKey.substring(0, 8)} quota exceeded, trying next key...`);
+                } else {
+                    console.log(`API error for ${type}: ${data.reason}`);
+                }
+            } catch (e) {
+                console.error(`Error syncing Juhe league ${type}:`, e);
             }
-        } catch (e) {
-            console.error(`Error syncing Juhe league ${type}:`, e);
+        }
+        
+        if (!success) {
+            console.log(`Failed to sync ${type} with all available keys`);
         }
     }
 };
@@ -724,41 +752,58 @@ export default {
                 // If DB is empty for this league, try a live sync once
                 if (results.length === 0 && page === 1) {
                     console.log(`DB empty for ${title}, triggering live sync...`);
-                    const juheKey = env.JUHE_API_KEY;
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 120 * 1000);
+                    const keys = [
+                        env.JUHE_API_KEY,
+                        env.JUHE_API_KEY_2
+                    ].filter(Boolean);
                     
-                    const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`, {
-                        signal: controller.signal
-                    });
-                    clearTimeout(timeoutId);
+                    let syncSuccess = false;
                     
-                    const data = await response.json();
-
-                    if (data.error_code === 0 && data.result && data.result.matchs) {
-                        const syncMatches = [];
-                        data.result.matchs.forEach(day => {
-                            day.list.forEach(m => {
-                                syncMatches.push({
-                                    home: m.team1,
-                                    away: m.team2,
-                                    home_logo: m.team1_logo,
-                                    away_logo: m.team2_logo,
-                                    league: data.result.title,
-                                    date: `${day.date}T${m.time_start}:00Z`,
-                                    score: `${m.team1_score} - ${m.team2_score}`,
-                                    status: m.status_text
-                                });
+                    for (const juheKey of keys) {
+                        if (syncSuccess) break;
+                        
+                        try {
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), 120 * 1000);
+                            
+                            const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`, {
+                                signal: controller.signal
                             });
-                        });
-                        await saveMatchesToDb(env, syncMatches, 'juhe_matches');
-                        // Re-query after sync
-                        const { results: retryResults } = await env.DB.prepare(sql).bind(...queryParams).all();
-                        results = retryResults;
+                            clearTimeout(timeoutId);
+                            
+                            const data = await response.json();
 
-                        // Re-fetch total if needed, but for simplicity we assume sync succeeded
-                        const { results: retryCountResults } = await env.DB.prepare(countSql).bind(...params).all();
-                        total = retryCountResults[0].total;
+                            if (data.error_code === 0 && data.result && data.result.matchs) {
+                                const syncMatches = [];
+                                data.result.matchs.forEach(day => {
+                                    day.list.forEach(m => {
+                                        syncMatches.push({
+                                            home: m.team1,
+                                            away: m.team2,
+                                            home_logo: m.team1_logo,
+                                            away_logo: m.team2_logo,
+                                            league: data.result.title,
+                                            date: `${day.date}T${m.time_start}:00Z`,
+                                            score: `${m.team1_score} - ${m.team2_score}`,
+                                            status: m.status_text
+                                        });
+                                    });
+                                });
+                                await saveMatchesToDb(env, syncMatches, 'juhe_matches');
+                                syncSuccess = true;
+                                // Re-query after sync
+                                const { results: retryResults } = await env.DB.prepare(sql).bind(...queryParams).all();
+                                results = retryResults;
+
+                                // Re-fetch total if needed
+                                const { results: retryCountResults } = await env.DB.prepare(countSql).bind(...params).all();
+                                total = retryCountResults[0].total;
+                            } else if (data.error_code === 10012) {
+                                console.log(`API key quota exceeded, trying next key...`);
+                            }
+                        } catch (e) {
+                            console.error(`Live sync error:`, e);
+                        }
                     }
                 }
 
