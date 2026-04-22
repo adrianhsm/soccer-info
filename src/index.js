@@ -106,7 +106,8 @@ const saveMatchesToDb = async (env, matchesData, tableName = 'matches') => {
 const getJuheApiKey = (env) => {
     const keys = [
         env.JUHE_API_KEY,
-        env.JUHE_API_KEY_2
+        env.JUHE_API_KEY_2,
+        env.JUHE_API_KEY_3
     ].filter(Boolean);
     
     return keys[0] || null;
@@ -754,7 +755,8 @@ export default {
                     console.log(`DB empty for ${title}, triggering live sync...`);
                     const keys = [
                         env.JUHE_API_KEY,
-                        env.JUHE_API_KEY_2
+                        env.JUHE_API_KEY_2,
+                        env.JUHE_API_KEY_3
                     ].filter(Boolean);
                     
                     let syncSuccess = false;
