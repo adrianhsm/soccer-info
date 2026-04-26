@@ -686,7 +686,7 @@ export default {
                 'dejia': '德国甲级联赛',
                 'yijia': '意大利甲级联赛',
                 'fajia': '法国甲级联赛',
-                'zhongchao': '中国足球超级联赛',
+                'zhongchao': '中国超级联赛',
                 'jiangsu': '苏格兰超级联赛'
             };
 
