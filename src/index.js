@@ -115,12 +115,15 @@ const getJuheApiKey = (env) => {
 
 const syncJuheMatches = async (env) => {
     const leagues = ['yingchao', 'xijia', 'dejia', 'yijia', 'fajia', 'zhongchao'];
+    const worldcupLeague = 'worldcup';
     const timeout = 120 * 1000;
     const keys = [
         env.JUHE_API_KEY,
-        env.JUHE_API_KEY_2
+        env.JUHE_API_KEY_2,
+        env.JUHE_API_KEY_3
     ].filter(Boolean);
 
+    // Sync regular leagues
     for (const type of leagues) {
         let success = false;
         
@@ -175,6 +178,81 @@ const syncJuheMatches = async (env) => {
         if (!success) {
             console.log(`Failed to sync ${type} with all available keys`);
         }
+    }
+    
+    // Sync World Cup using dedicated API (id=616)
+    console.log(`Syncing World Cup matches...`);
+    let worldcupSuccess = false;
+    
+    for (const juheKey of keys) {
+        if (worldcupSuccess) break;
+        
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeout);
+            
+            // World Cup API endpoint (id=616)
+            const response = await fetch(`http://apis.juhe.cn/fapig/worldCup/query?key=${juheKey}`, {
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            
+            const data = await response.json();
+            console.log(`World Cup API response:`, JSON.stringify(data).substring(0, 200));
+
+            if (data.error_code === 0 && data.result) {
+                const matches = [];
+                
+                // Handle different response structures
+                if (data.result.matchs) {
+                    data.result.matchs.forEach(day => {
+                        day.list.forEach(m => {
+                            matches.push({
+                                home: m.team1,
+                                away: m.team2,
+                                home_logo: m.team1_logo,
+                                away_logo: m.team2_logo,
+                                league: '世界杯',
+                                date: `${day.date}T${m.time_start || '00:00'}:00Z`,
+                                score: `${m.team1_score || '-'}-${m.team2_score || '-'}`,
+                                status: m.status_text || '完赛'
+                            });
+                        });
+                    });
+                } else if (Array.isArray(data.result)) {
+                    data.result.forEach(m => {
+                        matches.push({
+                            home: m.team1 || m.home,
+                            away: m.team2 || m.away,
+                            home_logo: m.team1_logo || '',
+                            away_logo: m.team2_logo || '',
+                            league: '世界杯',
+                            date: `${m.date || m.match_time}T${m.time_start || '00:00'}:00Z`,
+                            score: `${m.team1_score || m.team1Score || '-'}-${m.team2_score || m.team2Score || '-'}`,
+                            status: m.status_text || m.status || '完赛'
+                        });
+                    });
+                }
+                
+                if (matches.length > 0) {
+                    await saveMatchesToDb(env, matches, 'juhe_matches');
+                    worldcupSuccess = true;
+                    console.log(`Successfully synced ${matches.length} World Cup matches`);
+                } else {
+                    console.log(`No World Cup matches found in API response`);
+                }
+            } else if (data.error_code === 10012) {
+                console.log(`API key quota exceeded for World Cup, trying next key...`);
+            } else {
+                console.log(`World Cup API error: ${data.reason || data.error_code}`);
+            }
+        } catch (e) {
+            console.error(`Error syncing World Cup:`, e.message);
+        }
+    }
+    
+    if (!worldcupSuccess) {
+        console.log(`Failed to sync World Cup with all available keys`);
     }
 };
 
@@ -677,7 +755,10 @@ export default {
                 'dejia': 'dejia',
                 'yijia': 'yijia',
                 'fajia': 'fajia',
-                'zhongchao': 'zhongchao'
+                'zhongchao': 'zhongchao',
+                'worldcup': 'worldcup',
+                'world cup': 'worldcup',
+                '世界杯': 'worldcup'
             };
 
             const typeToTitle = {
@@ -687,7 +768,8 @@ export default {
                 'yijia': '意大利甲级联赛',
                 'fajia': '法国甲级联赛',
                 'zhongchao': '中国超级联赛',
-                'jiangsu': '苏格兰超级联赛'
+                'jiangsu': '苏格兰超级联赛',
+                'worldcup': '世界杯'
             };
 
             const targetLeague = leagueParam || query || 'yingchao';
