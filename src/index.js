@@ -184,65 +184,61 @@ const syncJuheMatches = async (env) => {
     console.log(`Syncing World Cup matches...`);
     let worldcupSuccess = false;
     
-    for (const juheKey of keys) {
-        if (worldcupSuccess) break;
-        
+    const worldcupKey = env.WORLDCUP_API_KEY;
+    
+    if (!worldcupKey) {
+        console.log(`World Cup API key not configured, skipping...`);
+    } else {
         try {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeout);
             
             // World Cup API endpoint (id=616)
-            const response = await fetch(`http://apis.juhe.cn/fapig/worldCup/query?key=${juheKey}`, {
+            const response = await fetch(`https://apis.juhe.cn/fapigw/worldcup2026/schedule?key=${worldcupKey}`, {
                 signal: controller.signal
             });
             clearTimeout(timeoutId);
             
             const data = await response.json();
-            console.log(`World Cup API response:`, JSON.stringify(data).substring(0, 200));
 
             if (data.error_code === 0 && data.result) {
                 const matches = [];
+                const scheduleList = data.result.schedule_list || [];
                 
-                // Handle different response structures
-                if (data.result.matchs) {
-                    data.result.matchs.forEach(day => {
-                        day.list.forEach(m => {
-                            matches.push({
-                                home: m.team1,
-                                away: m.team2,
-                                home_logo: m.team1_logo,
-                                away_logo: m.team2_logo,
-                                league: '世界杯',
-                                date: `${day.date}T${m.time_start || '00:00'}:00Z`,
-                                score: `${m.team1_score || '-'}-${m.team2_score || '-'}`,
-                                status: m.status_text || '完赛'
-                            });
-                        });
-                    });
-                } else if (Array.isArray(data.result)) {
-                    data.result.forEach(m => {
-                        matches.push({
-                            home: m.team1 || m.home,
-                            away: m.team2 || m.away,
-                            home_logo: m.team1_logo || '',
-                            away_logo: m.team2_logo || '',
-                            league: '世界杯',
-                            date: `${m.date || m.match_time}T${m.time_start || '00:00'}:00Z`,
-                            score: `${m.team1_score || m.team1Score || '-'}-${m.team2_score || m.team2Score || '-'}`,
-                            status: m.status_text || m.status || '完赛'
-                        });
-                    });
-                }
+                console.log(`Found ${scheduleList.length} schedule groups from World Cup API`);
                 
+                scheduleList.forEach(dayGroup => {
+                     const dayMatches = dayGroup.schedule_list || [];
+                     dayMatches.forEach(m => {
+                         const status = m.match_status === '1' ? '未开赛' : 
+                                        m.match_status === '2' ? '比赛中' : 
+                                        m.match_status === '3' ? '完赛' : m.match_des || '未知';
+                         
+                         // Convert date_time "2026-07-03 07:00:00" to "2026-07-03T07:00:00Z"
+                         const matchDate = m.date_time ? m.date_time.replace(' ', 'T') + 'Z' : `${m.date}T00:00:00Z`;
+                         
+                         matches.push({
+                             home: m.host_team_name,
+                             away: m.guest_team_name,
+                             home_logo: '',
+                             away_logo: '',
+                             league: `世界杯-${m.match_type_name || '小组赛'}`,
+                             date: matchDate,
+                             score: `${m.host_team_score || '-'}-${m.guest_team_score || '-'}`,
+                             status: status
+                         });
+                     });
+                 });
+                
+                console.log(`Prepared ${matches.length} World Cup matches to save`);
                 if (matches.length > 0) {
+                    console.log(`First match: ${JSON.stringify(matches[0])}`);
                     await saveMatchesToDb(env, matches, 'juhe_matches');
                     worldcupSuccess = true;
                     console.log(`Successfully synced ${matches.length} World Cup matches`);
                 } else {
                     console.log(`No World Cup matches found in API response`);
                 }
-            } else if (data.error_code === 10012) {
-                console.log(`API key quota exceeded for World Cup, trying next key...`);
             } else {
                 console.log(`World Cup API error: ${data.reason || data.error_code}`);
             }
@@ -252,7 +248,7 @@ const syncJuheMatches = async (env) => {
     }
     
     if (!worldcupSuccess) {
-        console.log(`Failed to sync World Cup with all available keys`);
+        console.log(`Failed to sync World Cup`);
     }
 };
 
