@@ -216,6 +216,11 @@ const syncJuheMatches = async (env) => {
                 scheduleList.forEach(dayGroup => {
                      const dayMatches = dayGroup.schedule_list || [];
                      dayMatches.forEach(m => {
+                         // Skip matches where teams are not determined yet (contains "胜者")
+                         if (m.host_team_name.includes('胜者') || m.guest_team_name.includes('胜者')) {
+                             return;
+                         }
+                         
                          const status = m.match_status === '1' ? '未开赛' : 
                                         m.match_status === '2' ? '比赛中' : 
                                         m.match_status === '3' ? '完赛' : m.match_des || '未知';
