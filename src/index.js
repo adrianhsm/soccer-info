@@ -33,12 +33,12 @@ async function getR2ObjectAsBase64(bucket, key) {
     }
 };
 
-const generateFiroSignature = async (privateKey, timestamp) => {
+const generateFiroSignature = async (privateKey, timestamp, apiKey) => {
     try {
+        const stringToSign = `apiKey=${apiKey}&timestamp=${timestamp}`;
         const pemLines = privateKey.match(/.{1,64}/g) || [];
-        const pemKey = `-----BEGIN RSA PRIVATE KEY-----\n${pemLines.join('\n')}\n-----END RSA PRIVATE KEY-----`;
-        const binaryData = pemKey.split('\n').filter(l => !l.includes('-----')).join('');
-        const keyData = Uint8Array.from(binaryData, c => c.charCodeAt(0));
+        const pemKey = `-----BEGIN PRIVATE KEY-----\n${pemLines.join('\n')}\n-----END PRIVATE KEY-----`;
+        const keyData = Uint8Array.from(atob(privateKey), c => c.charCodeAt(0));
         const key = await crypto.subtle.importKey(
             'pkcs8',
             keyData,
@@ -50,7 +50,7 @@ const generateFiroSignature = async (privateKey, timestamp) => {
         const signature = await crypto.subtle.sign(
             'RSASSA-PKCS1-v1_5',
             key,
-            encoder.encode(timestamp)
+            encoder.encode(stringToSign)
         );
         return btoa(String.fromCharCode(...new Uint8Array(signature)));
     } catch (e) {
@@ -69,7 +69,7 @@ const syncFiroLottery = async (env) => {
     const timestamp = Date.now().toString();
     
     try {
-        const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp);
+        const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY);
         
         const headers = {
             'X-API-Key': env.FIRO_API_KEY,
