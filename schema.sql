@@ -61,3 +61,38 @@ CREATE TABLE IF NOT EXISTS renjiu_matches (
 );
 CREATE INDEX IF NOT EXISTS idx_renjiu_matches_period ON renjiu_matches(period);
 CREATE INDEX IF NOT EXISTS idx_renjiu_matches_teams ON renjiu_matches(home_team, away_team);
+
+CREATE TABLE IF NOT EXISTS lottery_jc_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    match_time TEXT,
+    league TEXT,
+    score TEXT,
+    status TEXT,
+    home_logo TEXT,
+    away_logo TEXT,
+    odds TEXT,
+    lottery_type TEXT DEFAULT '竞彩',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(home_team, away_team, match_time)
+);
+
+CREATE TABLE IF NOT EXISTS lottery_bd_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    match_time TEXT,
+    league TEXT,
+    score TEXT,
+    status TEXT,
+    home_logo TEXT,
+    away_logo TEXT,
+    odds TEXT,
+    lottery_type TEXT DEFAULT '北单',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(home_team, away_team, match_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lottery_matches_time ON lottery_jc_matches(match_time);
+CREATE INDEX IF NOT EXISTS idx_lottery_bd_matches_time ON lottery_bd_matches(match_time);

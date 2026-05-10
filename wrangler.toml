@@ -10,12 +10,13 @@ JUHE_API_KEY = "3ab88d882bc6bfc7876522e5d4312cdc"
 JUHE_API_KEY_2 = "0bb962e79db05889e8f0cc80c0001c71"
 JUHE_API_KEY_3 = "abf6c6f15996b6dc166817d9452c56f9"
 WORLDCUP_API_KEY = "09b351bedd9e04db624c5b03841d2e1a"
+FIRO_API_KEY = "JDSiSnXpJ61pi162VEkjSFH80FgJtmAR"
+FIRO_PRIVATE_KEY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCXYgjWM7W46/EpskcfNe1UNYQOtxh3PsZNqV/rbBDEn5VQ0ZYvs+zIiAbOZTNszHCPw3tIR74XeGase5oQPq75l+/ZA1wbcv1/U7RC9FlV7dbh9oBQWl+detQeYGpP1A20GerfbH8lppag6E7sG/iroAEGzMcMtW4FdWOBsh11WVtjKWobK0C7uw/y5TQaQQcAuldKXW+5rzvVNDTmNFbH1v0b2zZ+62pSLDwgEteBY0iW0nPbBxHAWVbciNN0BQSTn/WSMTtjth4w+3vu8iJ6rVDhn+D3ESkHmdwmdIKm8FxHWD1AXfcpZ8jh/bIIjAjJ9r9hZjCRMC3Rv2UkKIIBAgMBAAECggEARKNjpFOv2pfIMgKucr1NzXeyV8W25yJkYYQhhKnr9GrzFcDh2uE2xDnA9EY4ieUsSFL3C+/TherGiwBD+4egaHT2gCwg0CVUQS4ftpf6BZcgbjYJOeWwIsQ1d0x6B5X7XKS/tOwJvnWJKI4Mcsu/9XlH3eBthBqjNwBhzMWIy9KyNCU0jFjFw28x8ZkKW8PZ2V8l6Tn7tCXuzPUYwY3EQlldJ2j+ARqB+wStYJJYUg/Zw7ehWFv9JMLaojF/0L3lawo1+z2kN7FvV1zH1s2yFLutMIiTPoAGOFxcHXBevdjMHoqb2ngelFQv2/WcWEfdY/TzIVl7sZ0cqYdop9LPEQKBgQDoph6qhldPRu4kyKtkztWfQVlvZKJU9dbdAk2T+LuhuAbRLSGT5xgSFtJfdXnCr9q9e3uVgRXZRg+zzK9pXLfFDY+TZNd/1Nv/DZlKZBVJEE28xjAwVlFCOL/t68PVAT6sm5dWQwsNtY9s3/DHEtansdm8f2xnhDdFGQEZgcPN1QKBgQCmk8wwBZs+6d0ldzPbZo449xn97FS9V0VwYewedCpRwyH6HOa2+/+ZoAfrbAuqAzucgSrV+ju/Bee9QqBArQBmPagYupdK8jbAcSJuTNz/Kd1wNuu1FNHQoRUc3W06gOcTI4qSU9ipgb5Snb+erF/TJLkXeG0Hu97lwKSRpdx9fQKBgBP2BNWOtzkHFfG0AfihQnTqj3jeQotVmHzX8L4MblTezD7wR1xATLFood4s3yiUHAl76cuXCr/cogZEPpykpuPSWQpFcbP3GHUWvptCYQ0mx/S1cHcFQO2UnusT+nZxJ+Z5Zw+wqucfN9IYmLkL5bz3pn3k1PFAx9k23wBIQPuNAoGAfJ2s73ACR/qkmlam0MfUNgGFzFR0wID9Tamz/sRgtHIKhRYB83pqKP9zbUeTIkjw25A1/4YIFEvSpd+mCzxhRBt0Gavdaw/wrd71JxcRbUJgioZLp1g/7pfTN5jfEhlExSidjgJz37tUKnIg3A+QUGD0pv5McrC1e6O2ec9fN/ECgYEA1UhWvnk3FOSbB4sMf+P+dDQr/XYPS6ViCQJQUBbSykvuxAPglI1+ohwZ+erWO+Yg2In+kmJmNg14Bp+m8Ym0pgOrW+cYsXgBqyccMbE33JUbo7NuN0NsiMWTDurjvRNspuNCyV54oiYxISieSpaRdQ3OGeaniA77O//EvhGHMWc="
 QWEN_API_KEY = "sk-5f2bab96bc824e509f361f033cc1ceba"
 
 [triggers]
-# Cron triggers - managed via Cloudflare Dashboard
-# Please delete old triggers in Dashboard first, then deploy with this config:
-# crons = ["0 0 * * *", "20 4 * * *", "40 8 * * *", "0 12 * * *", "20 16 * * *"]
+# Sync every 12 hours
+crons = ["0 */12 * * *"]
 
 [[d1_databases]]
 binding = "DB"

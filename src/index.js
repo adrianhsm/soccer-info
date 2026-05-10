@@ -31,7 +31,133 @@ async function getR2ObjectAsBase64(bucket, key) {
         console.error(`Error fetching from R2 (${key}):`, e);
         return null;
     }
-}
+};
+
+const generateFiroSignature = async (privateKey, timestamp) => {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(timestamp + privateKey);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return hashHex;
+};
+
+const syncFiroLottery = async (env) => {
+    if (!env.FIRO_API_KEY || !env.FIRO_PRIVATE_KEY) {
+        console.log('Firo API keys not configured, skipping...');
+        return;
+    }
+
+    const timeout = 60 * 1000;
+    const timestamp = Date.now().toString();
+    
+    try {
+        const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp);
+        
+        const headers = {
+            'X-API-Key': env.FIRO_API_KEY,
+            'X-Timestamp': timestamp,
+            'X-Signature': signature
+        };
+
+        console.log('Syncing Firo JC (竞彩) data...');
+        const jcController = new AbortController();
+        const jcTimeout = setTimeout(() => jcController.abort(), timeout);
+        
+        const jcResponse = await fetch('https://www.firoapi.com/firo/sports-lottery/list', {
+            headers,
+            signal: jcController.signal
+        });
+        clearTimeout(jcTimeout);
+        
+        const jcData = await jcResponse.json();
+        console.log(`JC API response: code=${jcData.code}, data count=${jcData.data?.length || 0}`);
+        
+        if (jcData.code === 200 && jcData.data) {
+            await saveFiroMatchesToDb(env, jcData.data, 'lottery_jc_matches', '竞彩');
+            console.log(`Synced JC matches successfully`);
+        }
+
+        console.log('Syncing Firo BD (北单) data...');
+        const bdController = new AbortController();
+        const bdTimeout = setTimeout(() => bdController.abort(), timeout);
+        
+        const bdResponse = await fetch('https://www.firoapi.com/firo/bd/issue-detail', {
+            headers,
+            signal: bdController.signal
+        });
+        clearTimeout(bdTimeout);
+        
+        const bdData = await bdResponse.json();
+        console.log(`BD API response: code=${bdData.code}, data=${JSON.stringify(bdData.data)?.substring(0, 200)}`);
+        
+        if (bdData.code === 200 && bdData.data) {
+            const allMatches = [];
+            bdData.data.issues?.forEach(issue => {
+                issue.matches?.forEach(m => {
+                    allMatches.push(m);
+                });
+            });
+            await saveFiroMatchesToDb(env, allMatches, 'lottery_bd_matches', '北单');
+            console.log(`Synced BD matches successfully`);
+        }
+    } catch (e) {
+        console.error('Error syncing Firo lottery:', e.message);
+    }
+};
+
+const saveFiroMatchesToDb = async (env, matchesData, tableName, lotteryType) => {
+    if (!matchesData || matchesData.length === 0) {
+        console.log(`No ${lotteryType} matches to save`);
+        return;
+    }
+
+    const queries = [];
+    
+    matchesData.forEach(m => {
+        let home, away, score, status, matchTime, league, odds;
+        
+        if (lotteryType === '竞彩') {
+            home = m.homeTeamName || m.home_team;
+            away = m.awayTeamName || m.away_team;
+            league = m.leagueName || m.league;
+            matchTime = m.matchStartDate ? `${m.matchStartDate}T${m.matchTime || '00:00:00'}:00Z` : null;
+            score = m.homeScore && m.awayScore ? `${m.homeScore} - ${m.awayScore}` : '- -';
+            status = m.matchStatus === 'Selling' ? '销售中' : m.matchStatus === 'Closed' ? '已结束' : '未知';
+            odds = m.matchOddsList ? JSON.stringify(m.matchOddsList) : null;
+        } else {
+            home = m.hostTeamFull || m.hostTeam;
+            away = m.guestTeamFull || m.guestTeam;
+            league = m.leagueName || lotteryType;
+            matchTime = m.matchGroupDt ? m.matchGroupDt.replace('T', 'T') + ':00Z' : null;
+            score = m.fullScore ? m.fullScore.replace(',', ' - ') : '- -';
+            status = m.drawed ? '已开奖' : m.matchState === 'Selling' ? '销售中' : '未开售';
+            const oddsData = {};
+            for (let i = 1; i <= 25; i++) {
+                const spKey = `sp${i}`;
+                if (m[spKey]) oddsData[spKey] = m[spKey];
+            }
+            odds = Object.keys(oddsData).length > 0 ? JSON.stringify(oddsData) : null;
+        }
+        
+        if (!home || !away) return;
+
+        queries.push(
+            env.DB.prepare(`
+                INSERT OR REPLACE INTO ${tableName} 
+                (home_team, away_team, match_time, league, score, status, odds, lottery_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind(home, away, matchTime, league, score, status, odds, lotteryType)
+        );
+    });
+
+    try {
+        await env.DB.batch(queries);
+        console.log(`Successfully synced ${matchesData.length} ${lotteryType} matches to ${tableName}`);
+    } catch (e) {
+        console.error(`Error saving ${lotteryType} matches:`, e);
+    }
+};
 
 const dialectVoiceMap = {
     '上海话': { female: 'Jada' },
@@ -629,6 +755,7 @@ export default {
         await syncJuheMatches(env);
         await syncRenjiuMatches(env);
         await supplementScoresFromLive500(env);
+        await syncFiroLottery(env);
         console.log('Cron job completed.');
     },
 
@@ -1827,6 +1954,61 @@ export default {
                 });
             } catch (e) {
                 console.error('Renjiu latest query error:', e);
+                return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/lottery') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            const type = url.searchParams.get('type') || 'JC';
+            const page = parseInt(url.searchParams.get('page') || '1');
+            const pageSize = parseInt(url.searchParams.get('pageSize') || '20');
+
+            try {
+                const tableName = type === 'BD' ? 'lottery_bd_matches' : 'lottery_jc_matches';
+                const offset = (page - 1) * pageSize;
+
+                const { results: countResults } = await env.DB.prepare(`SELECT COUNT(*) as total FROM ${tableName}`).all();
+                const total = countResults[0].total;
+
+                const { results: matches } = await env.DB.prepare(
+                    `SELECT * FROM ${tableName} ORDER BY match_time DESC LIMIT ? OFFSET ?`
+                ).bind(pageSize, offset).all();
+
+                return new Response(JSON.stringify({
+                    metadata: {
+                        total,
+                        page,
+                        pageSize,
+                        totalPages: Math.ceil(total / pageSize)
+                    },
+                    matches: matches.map(m => ({
+                        id: m.id,
+                        home: m.home_team,
+                        away: m.away_team,
+                        home_logo: m.home_logo,
+                        away_logo: m.away_logo,
+                        league: m.league,
+                        date: m.match_time,
+                        score: m.score || '- -',
+                        status: m.status,
+                        odds: m.odds ? JSON.parse(m.odds) : null
+                    }))
+                }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Lottery query error:', e);
                 return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
                     status: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
