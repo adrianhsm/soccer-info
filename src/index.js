@@ -35,11 +35,13 @@ async function getR2ObjectAsBase64(bucket, key) {
 
 const generateFiroSignature = async (privateKey, timestamp) => {
     try {
-        const binaryKey = Uint8Array.from(atob(privateKey), c => c.charCodeAt(0));
-        const pemKey = `-----BEGIN RSA PRIVATE KEY-----\n${privateKey.match(/.{1,64}/g).join('\n')}\n-----END RSA PRIVATE KEY-----`;
+        const pemLines = privateKey.match(/.{1,64}/g) || [];
+        const pemKey = `-----BEGIN RSA PRIVATE KEY-----\n${pemLines.join('\n')}\n-----END RSA PRIVATE KEY-----`;
+        const binaryData = pemKey.split('\n').filter(l => !l.includes('-----')).join('');
+        const keyData = Uint8Array.from(binaryData, c => c.charCodeAt(0));
         const key = await crypto.subtle.importKey(
             'pkcs8',
-            binaryKey,
+            keyData,
             { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
             false,
             ['sign']
