@@ -98,8 +98,11 @@ const saveMatchesToDb = async (env, matchesData, tableName = 'matches') => {
     try {
         await env.DB.batch(queries);
         console.log(`Successfully synced ${matchesData.length} matches to ${tableName}.`);
+        console.log(`Batch executed: ${queries.length} queries (${matchesData.length} matches * 2 queries)`);
     } catch (e) {
         console.error(`Error saving matches to ${tableName}:`, e);
+        console.error(`Query count: ${queries.length}`);
+        console.error(`First match: ${JSON.stringify(matchesData[0])}`);
     }
 };
 
@@ -200,10 +203,13 @@ const syncJuheMatches = async (env) => {
             clearTimeout(timeoutId);
             
             const data = await response.json();
+            
+            console.log(`World Cup API response keys: ${Object.keys(data).join(', ')}`);
+            console.log(`World Cup API result keys: ${data.result ? Object.keys(data.result).join(', ') : 'null'}`);
 
             if (data.error_code === 0 && data.result) {
                 const matches = [];
-                const scheduleList = data.result.schedule_list || [];
+                const scheduleList = data.result.data || [];
                 
                 console.log(`Found ${scheduleList.length} schedule groups from World Cup API`);
                 
@@ -222,7 +228,7 @@ const syncJuheMatches = async (env) => {
                              away: m.guest_team_name,
                              home_logo: '',
                              away_logo: '',
-                             league: `世界杯-${m.match_type_name || '小组赛'}`,
+                             league: '世界杯',
                              date: matchDate,
                              score: `${m.host_team_score || '-'}-${m.guest_team_score || '-'}`,
                              status: status
@@ -233,9 +239,15 @@ const syncJuheMatches = async (env) => {
                 console.log(`Prepared ${matches.length} World Cup matches to save`);
                 if (matches.length > 0) {
                     console.log(`First match: ${JSON.stringify(matches[0])}`);
-                    await saveMatchesToDb(env, matches, 'juhe_matches');
-                    worldcupSuccess = true;
-                    console.log(`Successfully synced ${matches.length} World Cup matches`);
+                    console.log(`Calling saveMatchesToDb...`);
+                    try {
+                        await saveMatchesToDb(env, matches, 'juhe_matches');
+                        worldcupSuccess = true;
+                        console.log(`Successfully synced ${matches.length} World Cup matches`);
+                    } catch (err) {
+                        console.error(`Error in saveMatchesToDb: ${err.message}`);
+                        console.error(err.stack);
+                    }
                 } else {
                     console.log(`No World Cup matches found in API response`);
                 }
