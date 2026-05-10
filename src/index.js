@@ -216,8 +216,9 @@ const syncJuheMatches = async (env) => {
                 scheduleList.forEach(dayGroup => {
                      const dayMatches = dayGroup.schedule_list || [];
                      dayMatches.forEach(m => {
-                         // Skip matches where teams are not determined yet (contains "胜者")
-                         if (m.host_team_name.includes('胜者') || m.guest_team_name.includes('胜者')) {
+                         // Skip matches where teams are not determined yet (contains "胜者" or "败者")
+                         if (m.host_team_name.includes('胜者') || m.guest_team_name.includes('胜者') ||
+                             m.host_team_name.includes('败者') || m.guest_team_name.includes('败者')) {
                              return;
                          }
                          
