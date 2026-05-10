@@ -70,6 +70,7 @@ const syncFiroLottery = async (env) => {
     
     try {
         const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY);
+        console.log(`Generated signature: ${signature.substring(0, 50)}...`);
         
         const headers = {
             'X-API-Key': env.FIRO_API_KEY,
@@ -78,6 +79,7 @@ const syncFiroLottery = async (env) => {
         };
 
         console.log('Syncing Firo JC (竞彩) data...');
+        console.log('Request headers:', JSON.stringify(headers));
         const jcController = new AbortController();
         const jcTimeout = setTimeout(() => jcController.abort(), timeout);
         
@@ -1915,6 +1917,30 @@ export default {
             } catch (e) {
                 console.error('Sync error:', e);
                 return new Response(JSON.stringify({ error: 'Sync failed', details: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/lottery/sync') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            try {
+                console.log('Manual sync triggered for lottery data...');
+                await syncFiroLottery(env);
+                return new Response(JSON.stringify({ message: 'Lottery sync completed successfully' }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Lottery sync error:', e);
+                return new Response(JSON.stringify({ error: 'Lottery sync failed', details: e.message }), {
                     status: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
