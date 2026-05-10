@@ -34,12 +34,27 @@ async function getR2ObjectAsBase64(bucket, key) {
 };
 
 const generateFiroSignature = async (privateKey, timestamp) => {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(timestamp + privateKey);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-    return hashHex;
+    try {
+        const binaryKey = Uint8Array.from(atob(privateKey), c => c.charCodeAt(0));
+        const pemKey = `-----BEGIN RSA PRIVATE KEY-----\n${privateKey.match(/.{1,64}/g).join('\n')}\n-----END RSA PRIVATE KEY-----`;
+        const key = await crypto.subtle.importKey(
+            'pkcs8',
+            binaryKey,
+            { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+            false,
+            ['sign']
+        );
+        const encoder = new TextEncoder();
+        const signature = await crypto.subtle.sign(
+            'RSASSA-PKCS1-v1_5',
+            key,
+            encoder.encode(timestamp)
+        );
+        return btoa(String.fromCharCode(...new Uint8Array(signature)));
+    } catch (e) {
+        console.error('Signature error:', e);
+        return '';
+    }
 };
 
 const syncFiroLottery = async (env) => {
