@@ -261,6 +261,34 @@ const getJuheApiKey = (env) => {
     return keys[0] || null;
 };
 
+const countryToFlag = {
+    '阿根廷': 'ar', '巴西': 'br', '法国': 'fr', '德国': 'de', '意大利': 'it',
+    '英格兰': 'gb-eng', '西班牙': 'es', '荷兰': 'nl', '比利时': 'be', '葡萄牙': 'pt',
+    '克罗地亚': 'hr', '丹麦': 'dk', '波兰': 'pl', '瑞士': 'ch', '奥地利': 'at',
+    '捷克': 'cz', '瑞典': 'se', '威尔士': 'gb-wls', '塞尔维亚': 'rs', '乌克兰': 'ua',
+    '墨西哥': 'mx', '美国': 'us', '加拿大': 'ca', '巴拿马': 'pa', '哥斯达黎加': 'cr',
+    '日本': 'jp', '韩国': 'kr', '伊朗': 'ir', '沙特阿拉伯': 'sa', '卡塔尔': 'qa',
+    '澳大利亚': 'au', '新西兰': 'nz',
+    '摩洛哥': 'ma', '突尼斯': 'tn', '塞内加尔': 'sn', '喀麦隆': 'cm', '加纳': 'gh',
+    '埃及': 'eg', '尼日利亚': 'ng', '阿尔及利亚': 'dz', '科特迪瓦': 'ci',
+    '哥伦比亚': 'co', '乌拉圭': 'uy', '秘鲁': 'pe', '智利': 'cl', '厄瓜多尔': 'ec',
+    '巴拉圭': 'py', '委内瑞拉': 've', '玻利维亚': 'bo',
+    '中国': 'cn', '印度': 'in', '印度尼西亚': 'id', '泰国': 'th', '越南': 'vn',
+    '土耳其': 'tr', '希腊': 'gr', '挪威': 'no', '芬兰': 'fi', '俄罗斯': 'ru',
+    '苏格兰': 'gb-sct', '爱尔兰': 'ie', '匈牙利': 'hu', '罗马尼亚': 'ro',
+    '斯洛伐克': 'sk', '斯洛文尼亚': 'si', '保加利亚': 'bg', '北马其顿': 'mk',
+    '南非': 'za', '民主刚果': 'cd', '加蓬': 'ga', '阿尔巴尼亚': 'al',
+    '波黑': 'ba', '黑山': 'me', '冰岛': 'is', '以色列': 'il'
+};
+
+const getFlagUrl = (countryName) => {
+    const code = countryToFlag[countryName];
+    if (code) {
+        return `https://flagcdn.com/w80/${code}.png`;
+    }
+    return '';
+};
+
 const syncJuheMatches = async (env) => {
     const leagues = ['yingchao', 'xijia', 'dejia', 'yijia', 'fajia', 'zhongchao'];
     const worldcupLeague = 'worldcup';
@@ -380,8 +408,8 @@ const syncJuheMatches = async (env) => {
                          matches.push({
                              home: m.host_team_name,
                              away: m.guest_team_name,
-                             home_logo: '',
-                             away_logo: '',
+                             home_logo: getFlagUrl(m.host_team_name),
+                             away_logo: getFlagUrl(m.guest_team_name),
                              league: '世界杯',
                              date: matchDate,
                              score: `${m.host_team_score || '-'}-${m.guest_team_score || '-'}`,
