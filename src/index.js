@@ -90,7 +90,7 @@ const syncFiroLottery = async (env) => {
         clearTimeout(jcTimeout);
         
         const jcData = await jcResponse.json();
-        console.log(`JC API response: code=${jcData.code}, data count=${jcData.data?.length || 0}`);
+        console.log(`JC API response: code=${jcData.code}, message=${jcData.message}, data=${JSON.stringify(jcData.data)?.substring(0, 500)}`);
         
         if (jcData.code === 200 && jcData.data) {
             await saveFiroMatchesToDb(env, jcData.data, 'lottery_jc_matches', '竞彩');
@@ -134,19 +134,30 @@ const saveFiroMatchesToDb = async (env, matchesData, tableName, lotteryType) => 
     const queries = [];
     
     matchesData.forEach(m => {
-        let home, away, score, status, matchTime, league, odds;
+        let home, away, score, status, matchTime, league, odds, homeLogo, awayLogo;
         
         if (lotteryType === '竞彩') {
-            home = m.homeTeamName || m.home_team;
-            away = m.awayTeamName || m.away_team;
-            league = m.leagueName || m.league;
-            matchTime = m.matchStartDate ? `${m.matchStartDate}T${m.matchTime || '00:00:00'}:00Z` : null;
-            score = m.homeScore && m.awayScore ? `${m.homeScore} - ${m.awayScore}` : '- -';
-            status = m.matchStatus === 'Selling' ? '销售中' : m.matchStatus === 'Closed' ? '已结束' : '未知';
+            const matchMain = m.matchMain || m;
+            home = matchMain.homeTeamName || m.homeTeamName;
+            away = matchMain.awayTeamName || m.awayTeamName;
+            homeLogo = matchMain.homeTeamBadgeUrl || m.homeTeamBadgeUrl || '';
+            awayLogo = matchMain.awayTeamBadgeUrl || m.awayTeamBadgeUrl || '';
+            league = matchMain.leagueName || m.leagueName || '竞彩';
+            const matchDate = matchMain.matchStartDate || m.matchStartDate || matchMain.matchDate;
+            const matchTimeStr = matchMain.matchTime || m.matchTime || '00:00';
+            matchTime = matchDate ? `${matchDate}T${matchTimeStr}:00Z` : null;
+            const homeScore = matchMain.homeScore || m.homeScore;
+            const awayScore = matchMain.awayScore || m.awayScore;
+            score = homeScore !== undefined && awayScore !== undefined ? `${homeScore} - ${awayScore}` : '- -';
+            const sellStatus = matchMain.sellStatus || m.sellStatus || matchMain.matchStatus;
+            status = sellStatus === 'Selling' || sellStatus === '1' ? '销售中' : 
+                     sellStatus === 'Closed' || sellStatus === '2' ? '已结束' : '未知';
             odds = m.matchOddsList ? JSON.stringify(m.matchOddsList) : null;
         } else {
             home = m.hostTeamFull || m.hostTeam;
             away = m.guestTeamFull || m.guestTeam;
+            homeLogo = '';
+            awayLogo = '';
             league = m.leagueName || lotteryType;
             matchTime = m.matchGroupDt ? m.matchGroupDt.replace('T', 'T') + ':00Z' : null;
             score = m.fullScore ? m.fullScore.replace(',', ' - ') : '- -';
@@ -164,9 +175,9 @@ const saveFiroMatchesToDb = async (env, matchesData, tableName, lotteryType) => 
         queries.push(
             env.DB.prepare(`
                 INSERT OR REPLACE INTO ${tableName} 
-                (home_team, away_team, match_time, league, score, status, odds, lottery_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `).bind(home, away, matchTime, league, score, status, odds, lotteryType)
+                (home_team, away_team, match_time, league, score, status, odds, lottery_type, home_logo, away_logo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind(home, away, matchTime, league, score, status, odds, lotteryType, homeLogo || '', awayLogo || '')
         );
     });
 
