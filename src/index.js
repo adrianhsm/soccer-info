@@ -111,14 +111,17 @@ const syncFiroLottery = async (env) => {
         console.log(`BD API response: code=${bdData.code}, data=${JSON.stringify(bdData.data)?.substring(0, 200)}`);
         
         if (bdData.code === 200 && bdData.data) {
+            const nonFootballLeagues = ['美职篮', '美职冰'];
             const allMatches = [];
             bdData.data.issues?.forEach(issue => {
                 issue.matches?.forEach(m => {
-                    allMatches.push(m);
+                    if (!nonFootballLeagues.includes(m.leagueName)) {
+                        allMatches.push(m);
+                    }
                 });
             });
             await saveFiroMatchesToDb(env, allMatches, 'lottery_bd_matches', '北单');
-            console.log(`Synced BD matches successfully`);
+            console.log(`Synced BD matches successfully, filtered ${bdData.data.issues?.reduce((sum, i) => sum + (i.matches?.length || 0), 0) - allMatches.length} non-football matches`);
         }
     } catch (e) {
         console.error('Error syncing Firo lottery:', e.message);
