@@ -156,9 +156,10 @@ const saveFiroMatchesToDb = async (env, matchesData, tableName, lotteryType) => 
         } else {
             home = m.hostTeamFull || m.hostTeam;
             away = m.guestTeamFull || m.guestTeam;
-            homeLogo = '';
-            awayLogo = '';
             league = m.leagueName || lotteryType;
+            const flagUrl = getFlagUrlByLeague(league);
+            homeLogo = getFlagUrl(home) || flagUrl || m.hostTeamBadgeUrl || '';
+            awayLogo = getFlagUrl(away) || flagUrl || m.guestTeamBadgeUrl || '';
             matchTime = m.matchGroupDt ? m.matchGroupDt.replace('T', 'T') + ':00Z' : null;
             score = m.fullScore ? m.fullScore.replace(',', ' - ') : '- -';
             status = m.drawed ? '已开奖' : m.matchState === 'Selling' ? '销售中' : '未开售';
@@ -292,10 +293,56 @@ const countryToFlag = {
     '波黑': 'ba', '黑山': 'me', '冰岛': 'is', '以色列': 'il'
 };
 
+const leagueToCountry = {
+    '芬超': 'fi', '芬甲': 'fi', '芬兰': 'fi',
+    '瑞典超': 'se', '瑞典甲': 'se', '瑞典': 'se',
+    '挪超': 'no', '挪甲': 'no', '挪威': 'no',
+    '丹超': 'dk', '丹麦': 'dk', '丹甲': 'dk',
+    '波兰甲': 'pl', '波兰超': 'pl', '波兰': 'pl',
+    '葡超': 'pt', '葡甲': 'pt', '葡萄牙': 'pt',
+    '瑞士超': 'ch', '瑞士甲': 'ch', '瑞士': 'ch',
+    '罗甲': 'ro', '罗马尼亚': 'ro',
+    '意乙': 'it', '意大利': 'it', '意甲': 'it',
+    '英超': 'gb-eng', '英冠': 'gb-eng', '英甲': 'gb-eng', '英乙': 'gb-eng', '英格兰': 'gb-eng',
+    '西乙': 'es', '西班牙': 'es', '西甲': 'es',
+    '法乙': 'fr', '法国': 'fr', '法甲': 'fr',
+    '苏超': 'gb-sct', '苏冠': 'gb-sct', '苏格兰': 'gb-sct',
+    '比甲': 'be', '比利时': 'be',
+    '爱超': 'ie', '爱尔兰超': 'ie', '爱尔兰': 'ie', '爱甲': 'ie',
+    '美职篮': 'us', '美职冰': 'us', '美足': 'us', '美国': 'us',
+    '澳超': 'au', '澳洲': 'au', '澳大利亚': 'au',
+    'J1联赛': 'jp', 'J2联赛': 'jp', '日本': 'jp', '日职': 'jp', '日乙': 'jp',
+    'K联赛': 'kr', '韩国': 'kr', '韩职': 'kr',
+    '中超': 'cn', '中国': 'cn', '中甲': 'cn',
+    '智利甲': 'cl', '智利': 'cl',
+    '巴西甲': 'br', '巴西': 'br',
+    '阿甲': 'ar', '阿根廷': 'ar',
+    '墨超': 'mx', '墨西哥': 'mx',
+    '土超': 'tr', '土耳其': 'tr',
+    '希腊超': 'gr', '希腊': 'gr',
+    '俄超': 'ru', '俄罗斯': 'ru',
+    '荷甲': 'nl', '荷兰': 'nl',
+    '奥甲': 'at', '奥地利': 'at',
+    '匈甲': 'hu', '匈牙利': 'hu',
+    '克亚': 'hr', '克罗地亚': 'hr',
+    '塞超': 'rs', '塞尔维亚': 'rs',
+    '乌超': 'ua', '乌克兰': 'ua',
+    '冰岛超': 'is', '冰岛': 'is',
+    '以超': 'il', '以色列': 'il'
+};
+
 const getFlagUrl = (countryName) => {
     const code = countryToFlag[countryName];
     if (code) {
         return `https://flagcdn.com/w80/${code}.png`;
+    }
+    return '';
+};
+
+const getFlagUrlByLeague = (leagueName) => {
+    const countryCode = leagueToCountry[leagueName];
+    if (countryCode) {
+        return `https://flagcdn.com/w80/${countryCode}.png`;
     }
     return '';
 };
