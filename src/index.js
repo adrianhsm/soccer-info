@@ -949,7 +949,11 @@ export default {
                 'zhongchao': 'zhongchao',
                 'worldcup': 'worldcup',
                 'world cup': 'worldcup',
-                '世界杯': 'worldcup'
+                '世界杯': 'worldcup',
+                'bd': 'lottery_bd',
+                '北单': 'lottery_bd',
+                'jc': 'lottery_jc',
+                '竞彩': 'lottery_jc'
             };
 
             const typeToTitle = {
@@ -968,6 +972,60 @@ export default {
             const title = typeToTitle[type] || targetLeague;
 
             try {
+                // Handle lottery data queries (BD and JC)
+                if (type === 'lottery_bd' || type === 'lottery_jc') {
+                    const tableName = type === 'lottery_bd' ? 'lottery_bd_matches' : 'lottery_jc_matches';
+                    const lotteryTitle = type === 'lottery_bd' ? '北单' : '竞彩';
+                    
+                    let whereClause = "";
+                    const params = [];
+                    
+                    if (query) {
+                        whereClause = "WHERE (home_team LIKE ? OR away_team LIKE ?)";
+                        params.push(`%${query}%`, `%${query}%`);
+                    }
+                    
+                    if (startDate) {
+                        whereClause += whereClause ? " AND match_time >= ? " : "WHERE match_time >= ? ";
+                        params.push(startDate);
+                    }
+                    if (endDate) {
+                        whereClause += whereClause ? " AND match_time <= ? " : "WHERE match_time <= ? ";
+                        params.push(endDate + "T23:59:59Z");
+                    }
+                    
+                    const countSql = `SELECT COUNT(*) as total FROM ${tableName} ${whereClause}`;
+                    const { results: countResults } = await env.DB.prepare(countSql).bind(...params).all();
+                    const total = countResults[0].total;
+                    
+                    let sql = `SELECT * FROM ${tableName} ${whereClause} ORDER BY match_time DESC LIMIT ? OFFSET ?`;
+                    const { results: matches } = await env.DB.prepare(sql).bind(...params, pageSize, offset).all();
+                    
+                    return new Response(JSON.stringify({
+                        metadata: {
+                            total,
+                            page,
+                            pageSize,
+                            totalPages: Math.ceil(total / pageSize),
+                            type: lotteryTitle
+                        },
+                        matches: matches.map(m => ({
+                            id: m.id,
+                            home: m.home_team,
+                            away: m.away_team,
+                            home_logo: m.home_logo || '',
+                            away_logo: m.away_logo || '',
+                            league: m.league || lotteryTitle,
+                            date: m.match_time,
+                            score: m.score || '- -',
+                            status: m.status,
+                            odds: m.odds ? JSON.parse(m.odds) : null
+                        }))
+                    }), {
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                }
+
                 // Auto-update non-finished games started more than 2 hours ago
                 // Note: DB stores match_time as Beijing Time (UTC+8) despite the 'Z' suffix
                 // So we need to generate Beijing Time - 2 hours in ISO format
