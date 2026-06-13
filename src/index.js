@@ -33,9 +33,20 @@ async function getR2ObjectAsBase64(bucket, key) {
     }
 };
 
-const generateFiroSignature = async (privateKey, timestamp, apiKey) => {
+const generateFiroSignature = async (privateKey, timestamp, apiKey, params = null) => {
     try {
-        const stringToSign = `apiKey=${apiKey}&timestamp=${timestamp}`;
+        // 签名公式: apiKey={apiKey}&timestamp={timestamp}&{排序后的参数}
+        const parts = [`apiKey=${apiKey}`, `timestamp=${timestamp}`];
+        if (params && typeof params === 'object') {
+            for (const key of Object.keys(params).sort()) {
+                const val = params[key];
+                if (val !== null && val !== undefined) {
+                    parts.push(`${key}=${val}`);
+                }
+            }
+        }
+        const stringToSign = parts.join('&');
+
         const pemLines = privateKey.match(/.{1,64}/g) || [];
         const pemKey = `-----BEGIN PRIVATE KEY-----\n${pemLines.join('\n')}\n-----END PRIVATE KEY-----`;
         const keyData = Uint8Array.from(atob(privateKey), c => c.charCodeAt(0));
@@ -56,6 +67,120 @@ const generateFiroSignature = async (privateKey, timestamp, apiKey) => {
     } catch (e) {
         console.error('Signature error:', e);
         return '';
+    }
+};
+
+const syncFiroMatchResults = async (env) => {
+    if (!env.FIRO_API_KEY || !env.FIRO_PRIVATE_KEY) {
+        console.log('Firo API keys not configured, skipping match-results sync...');
+        return;
+    }
+
+    const timeout = 60 * 1000;
+    const today = new Date();
+    const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+    const dayBefore = new Date(today.getTime() - 2 * 24 * 60 * 60 * 1000);
+    
+    const formatDate = (d) => d.toISOString().split('T')[0];
+    const startDate = formatDate(dayBefore);
+    const endDate = formatDate(yesterday);
+    
+    console.log(`Syncing JC match-results from ${startDate} to ${endDate}...`);
+
+    try {
+        const timestamp = Date.now().toString();
+        const params = { endDate, startDate };
+        const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY, params);
+        const headers = {
+            'X-API-Key': env.FIRO_API_KEY,
+            'X-Timestamp': timestamp,
+            'X-Signature': signature
+        };
+
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), timeout);
+
+        const apiUrl = `https://www.firoapi.com/firo/text/match-results?startDate=${startDate}&endDate=${endDate}`;
+        const response = await fetch(apiUrl, { headers, signal: controller.signal });
+        clearTimeout(tid);
+        
+        const data = await response.json();
+        console.log(`match-results API response: code=${data.code}, message=${data.message}, results count=${data.data?.results?.length || 0}`);
+        
+        if (data.code === 200 && data.data?.results) {
+            await updateJcMatchesWithResults(env, data.data.results);
+            console.log(`Successfully updated JC matches with results`);
+        }
+    } catch (e) {
+        console.error('Error syncing Firo match-results:', e.message);
+    }
+};
+
+const updateJcMatchesWithResults = async (env, results) => {
+    if (!results || results.length === 0) return;
+
+    const queries = [];
+    let skippedNotFinished = 0;
+    for (const r of results) {
+        // 只有比赛状态表述为"已结束"时才更新比分
+        // matchResultStatus: "2" 表示比赛已结束（有最终比分）
+        // poolStatus: "Payout" 表示已派奖
+        const isFinished = r.matchResultStatus === '2' || r.poolStatus === 'Payout';
+        if (!isFinished) {
+            skippedNotFinished++;
+            console.log(`Skip match ${r.matchNumStr || r.matchId} (${r.homeTeam} vs ${r.awayTeam}): matchResultStatus=${r.matchResultStatus}, poolStatus=${r.poolStatus}, 无最终比分`);
+            continue;
+        }
+
+        // 没有最终比分也跳过
+        if (!r.sectionsNo999 || r.sectionsNo999.trim() === '' || r.sectionsNo999 === '-:-') {
+            console.log(`Skip match ${r.matchNumStr || r.matchId} (${r.homeTeam} vs ${r.awayTeam}): 比分字段为空`);
+            continue;
+        }
+
+        const fullScore = r.sectionsNo999 || '';
+        const halfScore = r.sectionsNo1 || '';
+        const winFlag = r.winFlag || '';
+        const oddsData = {
+            h: r.h,
+            d: r.d,
+            a: r.a,
+            goalLine: r.goalLine,
+            winFlag: winFlag,
+            halfScore: halfScore,
+            oddsResults: r.oddsResults || []
+        };
+
+        const matchDate = r.matchDate;
+        if (!matchDate) continue;
+
+        const homeTeamName = r.homeTeam || r.allHomeTeam;
+        const awayTeamName = r.awayTeam || r.allAwayTeam;
+        if (!homeTeamName || !awayTeamName) continue;
+
+        queries.push(
+            env.DB.prepare(`
+                UPDATE lottery_jc_matches
+                SET score = ?,
+                    status = '已开奖',
+                    odds = ?,
+                    win_flag = ?
+                WHERE home_team = ? AND away_team = ? AND substr(match_time, 1, 10) = ?
+            `).bind(fullScore, JSON.stringify(oddsData), winFlag, homeTeamName, awayTeamName, matchDate)
+        );
+    }
+
+    if (skippedNotFinished > 0) {
+        console.log(`Skipped ${skippedNotFinished} matches with unfinished status`);
+    }
+    
+    if (queries.length > 0) {
+        try {
+            await env.DB.batch(queries);
+            console.log(`Updated ${queries.length} JC matches with results`);
+        } catch (e) {
+            console.error('Error updating JC matches:', e.message);
+        }
     }
 };
 
@@ -93,9 +218,15 @@ const syncFiroLottery = async (env) => {
         console.log(`JC API response: code=${jcData.code}, message=${jcData.message}, data=${JSON.stringify(jcData.data)?.substring(0, 500)}`);
         
         if (jcData.code === 200 && jcData.data) {
-            await saveFiroMatchesToDb(env, jcData.data, 'lottery_jc_matches', '竞彩');
-            console.log(`Synced JC matches successfully`);
+            const jcMatchIds = await saveFiroMatchesToDb(env, jcData.data, 'lottery_jc_matches', '竞彩');
+            console.log(`Synced JC matches successfully, ${jcMatchIds.length} matches to enrich`);
+            if (jcMatchIds.length > 0) {
+                await enrichJcMatchesWithFootballInfo(env, jcMatchIds);
+            }
         }
+
+        // JC 同步完成后，把 football_info 同步到 juhe_matches 的相同比赛
+        await syncFootballInfoToJuheMatches(env);
 
         console.log('Syncing Firo BD (北单) data...');
         const bdController = new AbortController();
@@ -131,16 +262,18 @@ const syncFiroLottery = async (env) => {
 const saveFiroMatchesToDb = async (env, matchesData, tableName, lotteryType) => {
     if (!matchesData || matchesData.length === 0) {
         console.log(`No ${lotteryType} matches to save`);
-        return;
+        return [];
     }
 
     const queries = [];
-    
+    const jcMatchIdsToEnrich = [];
+
     matchesData.forEach(m => {
-        let home, away, score, status, matchTime, league, odds, homeLogo, awayLogo;
-        
+        let home, away, score, status, matchTime, league, odds, homeLogo, awayLogo, matchId;
+
         if (lotteryType === '竞彩') {
             const matchMain = m.matchMain || m;
+            matchId = matchMain.matchId || m.matchId;
             home = matchMain.homeTeamName || m.homeTeamName;
             away = matchMain.awayTeamName || m.awayTeamName;
             homeLogo = matchMain.homeTeamBadgeUrl || m.homeTeamBadgeUrl || '';
@@ -153,17 +286,18 @@ const saveFiroMatchesToDb = async (env, matchesData, tableName, lotteryType) => 
             const awayScore = matchMain.awayScore || m.awayScore;
             score = homeScore !== undefined && awayScore !== undefined ? `${homeScore} - ${awayScore}` : '- -';
             const sellStatus = matchMain.sellStatus || m.sellStatus || matchMain.matchStatus;
-            status = sellStatus === 'Selling' || sellStatus === '1' ? '销售中' : 
+            status = sellStatus === 'Selling' || sellStatus === '1' ? '销售中' :
                      sellStatus === 'Closed' || sellStatus === '2' ? '已结束' : '未知';
             odds = m.matchOddsList ? JSON.stringify(m.matchOddsList) : null;
         } else {
+            matchId = m.matchId;
             home = m.hostTeamFull || m.hostTeam;
             away = m.guestTeamFull || m.guestTeam;
             league = m.leagueName || lotteryType;
             const flagUrl = getFlagUrlByLeague(league);
             homeLogo = getFlagUrl(home) || flagUrl || m.hostTeamBadgeUrl || '';
             awayLogo = getFlagUrl(away) || flagUrl || m.guestTeamBadgeUrl || '';
-            matchTime = m.matchGroupDt ? m.matchGroupDt.replace('T', 'T') + ':00Z' : null;
+            matchTime = m.endTime ? new Date(new Date(m.endTime).getTime() + 5 * 60 * 1000).toISOString() : (m.matchGroupDt ? m.matchGroupDt.replace('T', 'T') + ':00Z' : null);
             score = m.fullScore ? m.fullScore.replace(',', ' - ') : '- -';
             status = m.drawed ? '已开奖' : m.matchState === 'Selling' ? '销售中' : '未开售';
             const oddsData = {};
@@ -173,23 +307,164 @@ const saveFiroMatchesToDb = async (env, matchesData, tableName, lotteryType) => 
             }
             odds = Object.keys(oddsData).length > 0 ? JSON.stringify(oddsData) : null;
         }
-        
+
         if (!home || !away) return;
 
         queries.push(
             env.DB.prepare(`
-                INSERT OR REPLACE INTO ${tableName} 
-                (home_team, away_team, match_time, league, score, status, odds, lottery_type, home_logo, away_logo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `).bind(home, away, matchTime, league, score, status, odds, lotteryType, homeLogo || '', awayLogo || '')
+                INSERT OR REPLACE INTO ${tableName}
+                (home_team, away_team, match_time, league, score, status, odds, lottery_type, home_logo, away_logo, match_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind(home, away, matchTime, league, score, status, odds, lotteryType, homeLogo || '', awayLogo || '', matchId || null)
         );
+
+        if (lotteryType === '竞彩' && matchId) {
+            jcMatchIdsToEnrich.push(matchId);
+        }
     });
 
     try {
         await env.DB.batch(queries);
         console.log(`Successfully synced ${matchesData.length} ${lotteryType} matches to ${tableName}`);
+        return jcMatchIdsToEnrich;
     } catch (e) {
         console.error(`Error saving ${lotteryType} matches:`, e);
+        return [];
+    }
+};
+
+const enrichJcMatchesWithFootballInfo = async (env, matchIds) => {
+    if (!env.FIRO_API_KEY || !env.FIRO_PRIVATE_KEY) return;
+    if (!matchIds || matchIds.length === 0) {
+        console.log('No JC match IDs to enrich with football-info');
+        return;
+    }
+
+    const placeholders = matchIds.map(() => '?').join(',');
+    const existing = await env.DB.prepare(`
+        SELECT match_id FROM lottery_jc_matches
+        WHERE match_id IN (${placeholders}) AND football_info IS NOT NULL
+    `).bind(...matchIds).all();
+
+    const enrichedIds = new Set(existing.results?.map(r => r.match_id) || []);
+    const idsToFetch = matchIds.filter(id => !enrichedIds.has(id));
+
+    console.log(`JC football-info enrichment: ${idsToFetch.length} matches need fetching (already enriched: ${enrichedIds.size})`);
+
+    if (idsToFetch.length === 0) return;
+
+    const queries = [];
+    let successCount = 0;
+    let errorCount = 0;
+
+    for (const matchId of idsToFetch) {
+        try {
+            // 每个 matchId 需要单独的签名
+            const ts = Date.now().toString();
+            const sig = await generateFiroSignature(env.FIRO_PRIVATE_KEY, ts, env.FIRO_API_KEY, { matchId });
+            const headers = {
+                'X-API-Key': env.FIRO_API_KEY,
+                'X-Timestamp': ts,
+                'X-Signature': sig
+            };
+            const response = await fetch(`https://www.firoapi.com/firo/sports-lottery/football-info?matchId=${matchId}`, { headers });
+            const text = await response.text();
+
+            if (response.ok) {
+                const data = JSON.parse(text);
+                if (data.code === 200 && data.data) {
+                    queries.push(
+                        env.DB.prepare(`
+                            UPDATE lottery_jc_matches
+                            SET football_info = ?
+                            WHERE match_id = ?
+                        `).bind(JSON.stringify(data.data), matchId)
+                    );
+                    successCount++;
+                } else {
+                    console.log(`football-info match ${matchId}: API code=${data.code}, msg=${data.message}`);
+                    errorCount++;
+                }
+            } else {
+                console.log(`football-info match ${matchId}: HTTP ${response.status}`);
+                errorCount++;
+            }
+        } catch (e) {
+            console.error(`Error fetching football-info for match ${matchId}:`, e.message);
+            errorCount++;
+        }
+    }
+
+    if (queries.length > 0) {
+        try {
+            await env.DB.batch(queries);
+            console.log(`JC football-info enrichment: ${successCount} success, ${errorCount} failed`);
+        } catch (e) {
+            console.error('Error saving football-info:', e.message);
+        }
+    }
+};
+
+// 将 lottery_jc_matches / lottery_bd_matches 的 football_info 同步到 juhe_matches 中
+// 当主客队相同时，认为是同一场比赛
+const syncFootballInfoToJuheMatches = async (env) => {
+    try {
+        // 1. 先检查表是否有 football_info 列（容错处理 D1 副本同步延迟）
+        let juheHasFootballInfo = false;
+        try {
+            const { results: cols } = await env.DB.prepare(`PRAGMA table_info(juhe_matches)`).all();
+            juheHasFootballInfo = (cols || []).some(c => c.name === 'football_info');
+        } catch (e) {
+            console.log('PRAGMA failed:', e.message);
+        }
+
+        if (!juheHasFootballInfo) {
+            console.log('juhe_matches has no football_info column yet, skipping sync');
+            return;
+        }
+
+        // 2. 从 lottery_jc_matches 中取所有有 football_info 的记录
+        const { results: jcRows } = await env.DB.prepare(`
+            SELECT home_team, away_team, football_info
+            FROM lottery_jc_matches
+            WHERE football_info IS NOT NULL
+        `).all();
+
+        // 3. 从 lottery_bd_matches 中取所有有 football_info 的记录
+        const { results: bdRows } = await env.DB.prepare(`
+            SELECT home_team, away_team, football_info
+            FROM lottery_bd_matches
+            WHERE football_info IS NOT NULL
+        `).all();
+
+        const sourceRows = [...(jcRows || []), ...(bdRows || [])];
+        if (sourceRows.length === 0) {
+            console.log('No football_info in lottery tables to sync');
+            return;
+        }
+
+        console.log(`Syncing football_info from ${sourceRows.length} lottery matches to juhe_matches...`);
+
+        let updated = 0;
+
+        for (const row of sourceRows) {
+            // 按主客队匹配，更新 juhe_matches
+            const result = await env.DB.prepare(`
+                UPDATE juhe_matches
+                SET football_info = ?
+                WHERE home_team = ? AND away_team = ?
+                  AND (football_info IS NULL OR football_info = '')
+            `).bind(row.football_info, row.home_team, row.away_team).run();
+
+            const changes = result.meta?.changes || result.changes || 0;
+            if (changes > 0) {
+                updated += changes;
+            }
+        }
+
+        console.log(`Synced football_info to ${updated} juhe_matches records`);
+    } catch (e) {
+        console.error('Error syncing football_info to juhe_matches:', e.message);
     }
 };
 
@@ -505,6 +780,9 @@ const syncJuheMatches = async (env) => {
     if (!worldcupSuccess) {
         console.log(`Failed to sync World Cup`);
     }
+
+    // 同步 lottery 表的 football_info 到 juhe_matches
+    await syncFootballInfoToJuheMatches(env);
 };
 
 const fetchRenjiuPeriods = async () => {
@@ -857,14 +1135,26 @@ const normalizeTeamName = (teamName) => {
 
 export default {
     async scheduled(event, env, ctx) {
-        console.log('Cron job started: Syncing matches...');
-        const matchesData = await fetchTodayMatches(env);
-        await saveMatchesToDb(env, matchesData);
-        await syncJuheMatches(env);
-        await syncRenjiuMatches(env);
-        await supplementScoresFromLive500(env);
-        await syncFiroLottery(env);
-        console.log('Cron job completed.');
+        const cron = event.crons?.[0] || '';
+        console.log(`Cron job triggered: ${cron}`);
+        
+        if (cron === '0 */4 * * *') {
+            console.log('Running 4-hour sync: Juhe matches...');
+            await syncJuheMatches(env);
+            console.log('4-hour sync completed.');
+        } else if (cron === '0 * * * *') {
+            console.log('Running hourly sync: Firo lottery (BD/JC) + match-results...');
+            await syncFiroLottery(env);
+            await syncFiroMatchResults(env);
+            console.log('Hourly sync completed.');
+        } else {
+            console.log('Running default sync...');
+            const matchesData = await fetchTodayMatches(env);
+            await saveMatchesToDb(env, matchesData);
+            await syncJuheMatches(env);
+            await syncFiroLottery(env);
+            console.log('Default sync completed.');
+        }
     },
 
     // HTTP Handler
@@ -2070,6 +2360,180 @@ export default {
             }
         }
 
+        if (url.pathname === '/api/firo/bd') {
+            try {
+                const timestamp = Date.now().toString();
+                console.log('Using timestamp:', timestamp);
+                const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY);
+                const headers = {
+                    'X-API-Key': env.FIRO_API_KEY,
+                    'X-Timestamp': timestamp,
+                    'X-Signature': signature
+                };
+                
+                console.log('Calling Firo BD API with signature:', signature.substring(0, 30) + '...');
+                const response = await fetch('https://www.firoapi.com/firo/bd/issue-detail', { headers });
+                console.log('Firo response status:', response.status);
+                const text = await response.text();
+                
+                return new Response(text, {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Firo API error:', e);
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/firo/jc') {
+            try {
+                const timestamp = Date.now().toString();
+                const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY);
+                const headers = {
+                    'X-API-Key': env.FIRO_API_KEY,
+                    'X-Timestamp': timestamp,
+                    'X-Signature': signature
+                };
+                
+                const queryString = url.search || '';
+                const apiUrl = 'https://www.firoapi.com/firo/sports-lottery/list' + queryString;
+                console.log('Calling JC API:', apiUrl);
+                const response = await fetch(apiUrl, { headers });
+                const text = await response.text();
+                
+                return new Response(text, {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/firo/text/match-results') {
+            try {
+                const startDate = url.searchParams.get('startDate') || '';
+                const endDate = url.searchParams.get('endDate') || '';
+                const timestamp = Date.now().toString();
+                const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY);
+                const headers = {
+                    'X-API-Key': env.FIRO_API_KEY,
+                    'X-Timestamp': timestamp,
+                    'X-Signature': signature
+                };
+                
+                const params = [];
+                if (startDate) params.push(`startDate=${startDate}`);
+                if (endDate) params.push(`endDate=${endDate}`);
+                const apiUrl = 'https://www.firoapi.com/firo/text/match-results' + (params.length > 0 ? '?' + params.join('&') : '');
+                const response = await fetch(apiUrl, { headers });
+                const text = await response.text();
+                
+                return new Response(text, {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/firo/jc/all') {
+            try {
+                const dateParam = url.searchParams.get('date') || '';
+                const timestamp = Date.now().toString();
+                const params = dateParam ? { date: dateParam } : null;
+                const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY, params);
+                const headers = {
+                    'X-API-Key': env.FIRO_API_KEY,
+                    'X-Timestamp': timestamp,
+                    'X-Signature': signature
+                };
+                
+                const apiUrl = 'https://www.firoapi.com/firo/sports-lottery/all-list' + (dateParam ? '?date=' + dateParam : '');
+                const response = await fetch(apiUrl, { headers });
+                let text = await response.text();
+                
+                if (response.status === 401 && dateParam) {
+                    const listResponse = await fetch('https://www.firoapi.com/firo/sports-lottery/list', { headers });
+                    const listData = await listResponse.json();
+                    if (listData.code === 200 && listData.data) {
+                        const filtered = listData.data.filter(m => {
+                            const mm = m.matchMain || m;
+                            return mm.matchDate === dateParam || mm.matchStartDate === dateParam;
+                        });
+                        listData.data = filtered;
+                        listData._filtered = true;
+                        text = JSON.stringify(listData);
+                    }
+                }
+                
+                return new Response(text, {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/firo/match-results/sync') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            try {
+                console.log('Manual sync triggered for JC match-results...');
+                await syncFiroMatchResults(env);
+                return new Response(JSON.stringify({ message: 'JC match-results sync completed' }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Match-results sync error:', e);
+                return new Response(JSON.stringify({ error: 'Match-results sync failed', details: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/firo/football-info') {
+            try {
+                const matchId = url.searchParams.get('matchId') || '';
+                const timestamp = Date.now().toString();
+                const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY, { matchId });
+                const headers = {
+                    'X-API-Key': env.FIRO_API_KEY,
+                    'X-Timestamp': timestamp,
+                    'X-Signature': signature
+                };
+                const apiUrl = `https://www.firoapi.com/firo/sports-lottery/football-info?matchId=${matchId}`;
+                const response = await fetch(apiUrl, { headers });
+                const text = await response.text();
+                return new Response(text, {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
         if (url.pathname === '/api/lottery/sync') {
             const secret = request.headers.get('x-api-secret');
             if (secret !== env.API_SECRET) {
@@ -2091,6 +2555,50 @@ export default {
                     status: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
+            }
+        }
+
+        if (url.pathname === '/api/juhe/sync') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+
+            try {
+                console.log('Manual sync triggered for Juhe matches...');
+                await syncJuheMatches(env);
+                return new Response(JSON.stringify({ message: 'Juhe sync completed successfully' }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Juhe sync error:', e);
+                return new Response(JSON.stringify({ error: 'Juhe sync failed', details: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/debug/schema') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403 });
+            }
+            try {
+                const tables = ['juhe_matches', 'lottery_jc_matches', 'lottery_bd_matches'];
+                const result = {};
+                for (const t of tables) {
+                    const info = await env.DB.prepare(`PRAGMA table_info(${t})`).all();
+                    result[t] = info.results;
+                }
+                return new Response(JSON.stringify(result, null, 2), {
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), { status: 500 });
             }
         }
 
@@ -2189,6 +2697,7 @@ export default {
                         home_logo: m.home_logo,
                         away_logo: m.away_logo,
                         league: m.league,
+                        league_country: m.league,
                         date: m.match_time,
                         score: m.score || '- -',
                         status: m.status,

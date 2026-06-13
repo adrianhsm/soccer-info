@@ -15,8 +15,8 @@ FIRO_PRIVATE_KEY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCXYgjWM7W4
 QWEN_API_KEY = "sk-5f2bab96bc824e509f361f033cc1ceba"
 
 [triggers]
-# Sync every 12 hours
-crons = ["0 */12 * * *"]
+# Juhe matches sync every 4 hours, Firo lottery (BD/JC) sync every 1 hour
+crons = ["0 */4 * * *", "0 * * * *"]
 
 [[d1_databases]]
 binding = "DB"
