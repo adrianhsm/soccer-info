@@ -1245,6 +1245,7 @@ export default {
 
                     return new Response(JSON.stringify({
                         leagues: [], players: [], matches: results.map(r => ({
+                            id: r.id,
                             home: r.home_team,
                             away: r.away_team,
                             league: r.league,
@@ -1362,6 +1363,8 @@ export default {
                         },
                         matches: matches.map(m => ({
                             id: m.id,
+                            match_id: m.match_id || null,
+                            has_football_info: m.football_info ? true : false,
                             home: m.home_team,
                             away: m.away_team,
                             home_logo: m.home_logo || '',
@@ -1504,6 +1507,9 @@ export default {
                         }
                         
                         return {
+                            id: r.id,
+                            match_id: r.match_id || null,
+                            has_football_info: r.football_info ? true : false,
                             home: r.home_team,
                             away: r.away_team,
                             home_logo: r.home_logo,
@@ -2778,6 +2784,8 @@ export default {
                     },
                     matches: matches.map(m => ({
                         id: m.id,
+                        match_id: m.match_id || null,
+                        has_football_info: m.football_info ? true : false,
                         home: m.home_team,
                         away: m.away_team,
                         home_logo: m.home_logo,
