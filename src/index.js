@@ -2767,12 +2767,14 @@ export default {
             try {
                 const tableName = type === 'BD' ? 'lottery_bd_matches' : 'lottery_jc_matches';
                 const offset = (page - 1) * pageSize;
+                // JC 比赛过滤掉"世界杯"系列（这些比赛已在 juhe_matches 中）
+                const leagueFilter = type === 'JC' ? " WHERE league != '世界杯' AND league NOT LIKE '世界杯%' " : '';
 
-                const { results: countResults } = await env.DB.prepare(`SELECT COUNT(*) as total FROM ${tableName}`).all();
+                const { results: countResults } = await env.DB.prepare(`SELECT COUNT(*) as total FROM ${tableName}${leagueFilter}`).all();
                 const total = countResults[0].total;
 
                 const { results: matches } = await env.DB.prepare(
-                    `SELECT * FROM ${tableName} ORDER BY match_time DESC LIMIT ? OFFSET ?`
+                    `SELECT * FROM ${tableName}${leagueFilter} ORDER BY match_time DESC LIMIT ? OFFSET ?`
                 ).bind(pageSize, offset).all();
 
                 return new Response(JSON.stringify({
