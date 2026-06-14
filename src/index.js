@@ -2511,6 +2511,13 @@ export default {
         }
 
         if (url.pathname === '/api/firo/football-info') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
             try {
                 const matchId = url.searchParams.get('matchId') || '';
                 const timestamp = Date.now().toString();
@@ -2524,6 +2531,85 @@ export default {
                 const response = await fetch(apiUrl, { headers });
                 const text = await response.text();
                 return new Response(text, {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        // 从数据库读取 football-info（不调用 Firo API）
+        if (url.pathname === '/api/football-info/db') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            try {
+                const matchId = url.searchParams.get('matchId') || '';
+                const source = (url.searchParams.get('source') || 'juhe').toLowerCase();
+                if (!matchId) {
+                    return new Response(JSON.stringify({ error: 'matchId is required' }), {
+                        status: 400,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                }
+
+                const sourceMap = {
+                    juhe: { table: 'juhe_matches', idCol: 'id' },
+                    jc:   { table: 'lottery_jc_matches', idCol: 'match_id' },
+                    bd:   { table: 'lottery_bd_matches', idCol: 'match_id' }
+                };
+                const sources = source === 'all'
+                    ? ['juhe', 'jc', 'bd']
+                    : [source];
+                const invalid = sources.filter(s => !sourceMap[s]);
+                if (invalid.length) {
+                    return new Response(JSON.stringify({ error: `Invalid source: ${invalid.join(',')} (allowed: juhe, jc, bd, all)` }), {
+                        status: 400,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                }
+
+                const results = {};
+                for (const s of sources) {
+                    const { table, idCol } = sourceMap[s];
+                    const stmt = env.DB.prepare(
+                        `SELECT * FROM ${table} WHERE ${idCol} = ? LIMIT 1`
+                    ).bind(matchId);
+                    const row = await stmt.first();
+                    if (row) {
+                        let info = null;
+                        try {
+                            info = row.football_info ? JSON.parse(row.football_info) : null;
+                        } catch (e) {
+                            info = row.football_info;
+                        }
+                        results[s] = {
+                            found: true,
+                            match_id: row.match_id,
+                            home_team: row.home_team || row.home || null,
+                            away_team: row.away_team || row.away || null,
+                            match_date: row.match_date || row.date || null,
+                            league: row.league || null,
+                            football_info: info
+                        };
+                    } else {
+                        results[s] = { found: false, match_id: matchId };
+                    }
+                }
+
+                return new Response(JSON.stringify({
+                    code: 200,
+                    matchId,
+                    source,
+                    data: source === 'all' ? results : results[source]
+                }), {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
             } catch (e) {
