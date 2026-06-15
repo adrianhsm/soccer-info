@@ -331,13 +331,36 @@ const saveFiroMatchesToDb = async (env, matchesData, tableName, lotteryType) => 
 
         if (!home || !away) return;
 
-        queries.push(
-            env.DB.prepare(`
-                INSERT OR REPLACE INTO ${tableName}
-                (home_team, away_team, match_time, league, score, status, odds, lottery_type, home_logo, away_logo, match_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `).bind(home, away, matchTime, league, score, status, odds, lotteryType, homeLogo || '', awayLogo || '', matchId || null)
-        );
+        // BD 表使用 UPSERT（按 home_team + away_team + 同一天匹配），保留原 id 和 created_at
+        // lottery_bd_matches 已有 UNIQUE 索引 idx_lottery_bd_unique
+        // lottery_jc_matches 没有 UNIQUE 约束，用 INSERT OR REPLACE 退化为纯 INSERT
+        if (tableName === 'lottery_bd_matches') {
+            queries.push(
+                env.DB.prepare(`
+                    INSERT INTO ${tableName}
+                    (home_team, away_team, match_time, league, score, status, odds, lottery_type, home_logo, away_logo, match_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(home_team, away_team, substr(match_time, 1, 10))
+                    DO UPDATE SET
+                        match_time = excluded.match_time,
+                        league = excluded.league,
+                        score = excluded.score,
+                        status = excluded.status,
+                        odds = excluded.odds,
+                        home_logo = excluded.home_logo,
+                        away_logo = excluded.away_logo,
+                        match_id = excluded.match_id
+                `).bind(home, away, matchTime, league, score, status, odds, lotteryType, homeLogo || '', awayLogo || '', matchId || null)
+            );
+        } else {
+            queries.push(
+                env.DB.prepare(`
+                    INSERT OR REPLACE INTO ${tableName}
+                    (home_team, away_team, match_time, league, score, status, odds, lottery_type, home_logo, away_logo, match_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `).bind(home, away, matchTime, league, score, status, odds, lotteryType, homeLogo || '', awayLogo || '', matchId || null)
+            );
+        }
 
         if (lotteryType === '竞彩' && matchId) {
             jcMatchIdsToEnrich.push(matchId);
