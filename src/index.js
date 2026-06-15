@@ -229,6 +229,9 @@ const syncFiroLottery = async (env) => {
         await syncFootballInfoToJuheMatches(env);
 
         console.log('Syncing Firo BD (北单) data...');
+        // ⚠️ 重要：BD 比赛**仅**从 Firo bd/issue-detail 获取，不使用 juhe
+        // lottery_bd_matches 表只允许由 Firo 写入（见 saveFiroMatchesToDb 调用点 line 254）
+        // syncJuheMatches 中没有 BD 联赛的同步路径
         const bdController = new AbortController();
         const bdTimeout = setTimeout(() => bdController.abort(), timeout);
         
