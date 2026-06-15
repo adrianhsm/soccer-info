@@ -245,6 +245,9 @@ const syncFiroLottery = async (env) => {
         console.log(`BD API response: code=${bdData.code}, data=${JSON.stringify(bdData.data)?.substring(0, 200)}`);
         
         if (bdData.code === 200 && bdData.data) {
+            // 📝 记录 sync 日志到数据库（用于排查数据源问题）
+            const drawNo = bdData.data.drawNo || 'unknown';
+            const totalMatches = bdData.data.issues?.reduce((sum, i) => sum + (i.matches?.length || 0), 0) || 0;
             const nonFootballLeagues = ['美职篮', '美职冰'];
             const allMatches = [];
             bdData.data.issues?.forEach(issue => {
@@ -254,8 +257,23 @@ const syncFiroLottery = async (env) => {
                     }
                 });
             });
+            try {
+                await env.DB.prepare(
+                    `INSERT INTO sync_logs (sync_type, draw_no, matches_count, source, success) VALUES (?, ?, ?, ?, 1)`
+                ).bind('BD', drawNo, allMatches.length, 'Firo').run();
+            } catch (e) {
+                console.error('Failed to write sync log:', e.message);
+            }
             await saveFiroMatchesToDb(env, allMatches, 'lottery_bd_matches', '北单');
-            console.log(`Synced BD matches successfully, filtered ${bdData.data.issues?.reduce((sum, i) => sum + (i.matches?.length || 0), 0) - allMatches.length} non-football matches`);
+            console.log(`Synced BD matches successfully, filtered ${totalMatches - allMatches.length} non-football matches, drawNo=${drawNo}`);
+        } else {
+            try {
+                await env.DB.prepare(
+                    `INSERT INTO sync_logs (sync_type, draw_no, matches_count, source, success, error_msg) VALUES (?, ?, ?, ?, 0, ?)`
+                ).bind('BD', 'N/A', 0, 'Firo', bdData.message || 'unknown error').run();
+            } catch (e) {
+                console.error('Failed to write sync log:', e.message);
+            }
         }
     } catch (e) {
         console.error('Error syncing Firo lottery:', e.message);
