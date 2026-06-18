@@ -2752,10 +2752,17 @@ export default {
                      LIMIT ? OFFSET ?`
                 ).bind(pageSize, offset).all();
 
+                // ⚠️ juhe worldcup2026/news 接口不返回 content 字段，详情接口未公开
+                // 这里动态生成 search_url 让前端跳转到百度搜索原文
+                const enriched = results.map(n => ({
+                    ...n,
+                    search_url: `https://www.baidu.com/s?wd=${encodeURIComponent((n.title || '') + ' ' + (n.news_source || ''))}`
+                }));
+
                 return new Response(JSON.stringify({
                     code: 200,
                     metadata: { total, page, pageSize, totalPages: Math.ceil(total / pageSize) },
-                    data: results
+                    data: enriched
                 }), {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
