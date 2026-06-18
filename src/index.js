@@ -825,8 +825,67 @@ const syncJuheMatches = async (env) => {
         console.log(`Failed to sync World Cup`);
     }
 
+    // 同步世界杯资讯
+    await syncWorldcupNews(env);
+
     // 同步 lottery 表的 football_info 到 juhe_matches
     await syncFootballInfoToJuheMatches(env);
+};
+
+/**
+ * 同步世界杯资讯（juhe API id=616, endpoint=worldcup2026/news）
+ */
+const syncWorldcupNews = async (env) => {
+    const worldcupKey = env.WORLDCUP_API_KEY;
+    if (!worldcupKey) {
+        console.log('World Cup news API key not configured, skipping...');
+        return;
+    }
+
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 20000);
+        const response = await fetch(`https://apis.juhe.cn/fapigw/worldcup2026/news?key=${worldcupKey}&num=30`, {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        const data = await response.json();
+
+        if (data.error_code !== 0 || !data.result?.data) {
+            console.log(`World Cup news API error: ${data.reason || data.error_code}`);
+            try {
+                await env.DB.prepare(
+                    `INSERT INTO sync_logs (sync_type, draw_no, matches_count, source, success, error_msg) VALUES (?, ?, ?, ?, 0, ?)`
+                ).bind('WorldcupNews', 'N/A', 0, 'Juhe', data.reason || 'unknown error').run();
+            } catch (e) {}
+            return;
+        }
+
+        const items = data.result.data;
+        console.log(`World Cup news: fetched ${items.length} items`);
+
+        // UPSERT 到 worldcup_news 表（id 是主键，自动去重）
+        const stmt = env.DB.prepare(`
+            INSERT INTO worldcup_news (id, title, img, publish_time, news_source)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                img = excluded.img,
+                publish_time = excluded.publish_time,
+                news_source = excluded.news_source
+        `);
+        const batch = items.map(n => stmt.bind(n.id, n.title, n.img || '', n.publish_time || '', n.news_source || ''));
+        await env.DB.batch(batch);
+
+        try {
+            await env.DB.prepare(
+                `INSERT INTO sync_logs (sync_type, draw_no, matches_count, source, success) VALUES (?, ?, ?, ?, 1)`
+            ).bind('WorldcupNews', 'N/A', items.length, 'Juhe').run();
+        } catch (e) {}
+        console.log(`World Cup news synced: ${items.length} items`);
+    } catch (e) {
+        console.error('Error syncing world cup news:', e.message);
+    }
 };
 
 const fetchRenjiuPeriods = async () => {
@@ -2659,6 +2718,70 @@ export default {
                     matchId,
                     source,
                     data: source === 'all' ? results : results[source]
+                }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        // 世界杯资讯列表（公开访问，含 x-api-secret 鉴权）
+        if (url.pathname === '/api/worldcup/news') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            try {
+                const page = parseInt(url.searchParams.get('page') || '1');
+                const pageSize = Math.min(parseInt(url.searchParams.get('pageSize') || '20'), 50);
+                const offset = (page - 1) * pageSize;
+
+                const countResult = await env.DB.prepare(`SELECT COUNT(*) as total FROM worldcup_news`).first();
+                const total = countResult.total;
+                const { results } = await env.DB.prepare(
+                    `SELECT id, title, img, publish_time, news_source, created_at
+                     FROM worldcup_news
+                     ORDER BY publish_time DESC, id DESC
+                     LIMIT ? OFFSET ?`
+                ).bind(pageSize, offset).all();
+
+                return new Response(JSON.stringify({
+                    code: 200,
+                    metadata: { total, page, pageSize, totalPages: Math.ceil(total / pageSize) },
+                    data: results
+                }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        // 手动触发世界杯资讯同步
+        if (url.pathname === '/api/worldcup/news/sync') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            try {
+                await syncWorldcupNews(env);
+                const countResult = await env.DB.prepare(`SELECT COUNT(*) as total FROM worldcup_news`).first();
+                return new Response(JSON.stringify({
+                    message: 'World Cup news sync completed',
+                    total: countResult.total
                 }), {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
