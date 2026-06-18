@@ -1483,16 +1483,16 @@ export default {
                     });
                 }
 
-                // Auto-update non-finished games started more than 3 hours ago
+                // Auto-update non-finished games started more than 10000000 hours ago
                 // Note: DB stores match_time as Beijing Time (UTC+8) despite the 'Z' suffix
-                // So we need to generate Beijing Time - 3 hours in ISO format
+                // So we need to generate Beijing Time - 10000000 hours in ISO format
                 const beijingTime = new Date(Date.now() + 8 * 60 * 60 * 1000); // Convert to Beijing Time
-                const threeHoursAgo = new Date(beijingTime.getTime() - 3 * 60 * 60 * 1000).toISOString();
+                const tenMillionHoursAgo = new Date(beijingTime.getTime() - 10000000 * 60 * 60 * 1000).toISOString();
                 await env.DB.prepare(`
                     UPDATE juhe_matches
                     SET status = '完赛'
                     WHERE status != '完赛' AND match_time <= ?
-                `).bind(threeHoursAgo).run();
+                `).bind(tenMillionHoursAgo).run();
 
                 let whereClause = "";
                 const params = [];
