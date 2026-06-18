@@ -2800,6 +2800,91 @@ export default {
             }
         }
 
+        // 世界杯聚合接口：一次返回 资讯 + 比赛 + 统计
+        if (url.pathname === '/api/worldcup/all') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            try {
+                const newsLimit = Math.min(parseInt(url.searchParams.get('newsLimit') || '10'), 50);
+                const matchesLimit = Math.min(parseInt(url.searchParams.get('matchesLimit') || '20'), 50);
+                const matchStatus = url.searchParams.get('matchStatus'); // 完赛/未开赛（可选）
+
+                // 1. 资讯列表
+                const { results: newsList } = await env.DB.prepare(
+                    `SELECT id, title, img, publish_time, news_source, created_at
+                     FROM worldcup_news
+                     ORDER BY publish_time DESC, id DESC
+                     LIMIT ?`
+                ).bind(newsLimit).all();
+                const newsEnriched = newsList.map(n => ({
+                    ...n,
+                    search_url: `https://www.baidu.com/s?wd=${encodeURIComponent((n.title || '') + ' ' + (n.news_source || ''))}`
+                }));
+
+                // 2. 世界杯比赛列表（来自 juhe_matches，league=世界杯）
+                // 注意：juhe_matches 字段是 home_team/away_team，没有 match_id/round 列
+                let matchQuery = `
+                    SELECT id, home_team, away_team, home_logo, away_logo,
+                           match_time, score, status, league, period
+                    FROM juhe_matches
+                    WHERE league = '世界杯'
+                `;
+                const matchParams = [];
+                if (matchStatus) {
+                    matchQuery += ' AND status = ?';
+                    matchParams.push(matchStatus);
+                }
+                matchQuery += ' ORDER BY match_time ASC LIMIT ?';
+                matchParams.push(matchesLimit);
+                const { results: matchList } = await env.DB.prepare(matchQuery).bind(...matchParams).all();
+                const matchesEnriched = matchList.map(m => ({
+                    id: m.id,
+                    match_id: null, // juhe_matches 没有 match_id
+                    home: m.home_team,
+                    away: m.away_team,
+                    home_logo: m.home_logo,
+                    away_logo: m.away_logo,
+                    match_time: m.match_time,
+                    score: m.score,
+                    status: m.status,
+                    league: m.league,
+                    period: m.period,
+                    has_football_info: !!m.period || m.status === '完赛' // football_info 同步过的会有 period
+                }));
+
+                // 3. 统计
+                const statsResult = await env.DB.prepare(`
+                    SELECT
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = '完赛' THEN 1 ELSE 0 END) as finished,
+                        SUM(CASE WHEN status = '未开赛' THEN 1 ELSE 0 END) as upcoming
+                    FROM juhe_matches WHERE league = '世界杯'
+                `).first();
+                const newsCount = await env.DB.prepare(`SELECT COUNT(*) as c FROM worldcup_news`).first();
+
+                return new Response(JSON.stringify({
+                    code: 200,
+                    metadata: {
+                        news: { total: newsCount.c, returned: newsEnriched.length },
+                        matches: { total: statsResult.total, finished: statsResult.finished, upcoming: statsResult.upcoming, returned: matchesEnriched.length }
+                    },
+                    data: { news: newsEnriched, matches: matchesEnriched }
+                }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
         if (url.pathname === '/api/lottery/sync') {
             const secret = request.headers.get('x-api-secret');
             if (secret !== env.API_SECRET) {
