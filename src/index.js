@@ -512,6 +512,300 @@ const syncFootballInfoToJuheMatches = async (env) => {
     }
 };
 
+/**
+ * 从 Firo 抓取赔率写入 juhe_matches.odds
+ * 1. 拉取未填 odds 的 juhe_matches
+ * 2. 按日期调 Firo sports-lottery/list 拿当天的所有 matchOddsList
+ * 3. 在 lottery_jc_matches / lottery_bd_matches 中按主队/客队/时间±1h 找 firo matchId
+ * 4. 写入 juhe_matches.odds
+ */
+const syncOddsFromFiro = async (env) => {
+    try {
+        // 1. 检查 odds 列是否存在
+        let hasOdds = false;
+        try {
+            const { results: cols } = await env.DB.prepare(`PRAGMA table_info(juhe_matches)`).all();
+            hasOdds = (cols || []).some(c => c.name === 'odds');
+        } catch (e) {}
+        if (!hasOdds) {
+            console.log('juhe_matches has no odds column, skipping');
+            return;
+        }
+
+        // 2. 取需要赔率的比赛（odds 为空，且比赛时间在未来 7 天内或 30 天内已结束）
+        const { results: juheRows } = await env.DB.prepare(`
+            SELECT id, home_team, away_team, match_time
+            FROM juhe_matches
+            WHERE (odds IS NULL OR odds = '')
+              AND match_time IS NOT NULL
+              AND match_time >= datetime('now', '-30 days')
+              AND match_time <= datetime('now', '+7 days')
+            ORDER BY match_time ASC
+        `).all();
+
+        if (!juheRows || juheRows.length === 0) {
+            console.log('No juhe_matches need odds sync');
+            await logSync(env, 'Odds-Debug', 'Firo-EMPTY', true, 0, `juheRows is empty, dateGroups.size=0`);
+            return;
+        }
+
+        console.log(`Found ${juheRows.length} juhe_matches needing odds`);
+        await logSync(env, 'Odds-Debug', 'Firo-INIT', true, juheRows.length, `juheRows.length=${juheRows.length}`);
+
+        // 3. 按日期分组（避免重复调用 Firo）
+        const dateGroups = new Map();
+        for (const r of juheRows) {
+            const d = (r.match_time || '').substring(0, 10); // YYYY-MM-DD
+            if (d) {
+                if (!dateGroups.has(d)) dateGroups.set(d, []);
+                dateGroups.get(d).push(r);
+            }
+        }
+
+        // 工具：根据 YYYY-MM-DD 加 N 天
+        const addDays = (dateStr, days) => {
+            const d = new Date(dateStr + 'T00:00:00Z');
+            d.setUTCDate(d.getUTCDate() + days);
+            return d.toISOString().substring(0, 10);
+        };
+
+        // 缓存 firoMap：跨日期复用 + 减少 API 调用
+        const firoMapCache = new Map();
+
+        // 加载某日期的 Firo 数据到 firoMap
+        const loadFiroDate = async (date) => {
+            if (firoMapCache.has(date)) return firoMapCache.get(date);
+
+            const timestamp = Date.now().toString();
+            // 关键：签名不传 params（与 /api/firo/jc 端点一致），Firo 验证期待不带 date 的签名
+            const signature = await generateFiroSignature(env.FIRO_PRIVATE_KEY, timestamp, env.FIRO_API_KEY);
+
+            if (!signature) {
+                await logSync(env, 'Odds-Debug', `Firo-SigFail-${date}`, false, 0, `Signature generation failed`);
+                firoMapCache.set(date, new Map());
+                return firoMapCache.get(date);
+            }
+
+            const headers = {
+                'X-API-Key': env.FIRO_API_KEY,
+                'X-Timestamp': timestamp,
+                'X-Signature': signature
+            };
+
+            const firoUrl = `https://www.firoapi.com/firo/sports-lottery/list?date=${date}`;
+            try {
+                const ctrl = new AbortController();
+                const tmid = setTimeout(() => ctrl.abort(), 15000);
+                const resp = await fetch(firoUrl, { headers, signal: ctrl.signal });
+                clearTimeout(tmid);
+                const firoData = await resp.json();
+
+                if (firoData.code !== 200) {
+                    await logSync(env, 'Odds-Debug', `Firo-NonOK-${date}`, false, 0, `code=${firoData.code}, msg=${firoData.message || 'unknown'}`);
+                    firoMapCache.set(date, new Map());
+                    return firoMapCache.get(date);
+                }
+
+                if (!Array.isArray(firoData.data)) {
+                    await logSync(env, 'Odds-Debug', `Firo-NoData-${date}`, false, 0, `data is not array: ${typeof firoData.data}`);
+                    firoMapCache.set(date, new Map());
+                    return firoMapCache.get(date);
+                }
+
+                // 构建 map：按 matchId 索引
+                const map = new Map();
+                for (const m of firoData.data) {
+                    const main = m.matchMain || {};
+                    if (main.matchId) {
+                        map.set(main.matchId, {
+                            matchStartDate: main.matchStartDate || main.matchDate,
+                            matchDate: main.matchDate,
+                            matchTime: main.matchTime,
+                            homeTeam: main.homeTeamName,
+                            awayTeam: main.awayTeamName,
+                            oddsList: m.matchOddsList || []
+                        });
+                    }
+                }
+                firoMapCache.set(date, map);
+                return map;
+            } catch (e) {
+                await logSync(env, 'Odds-Debug', `Firo-Exception-${date}`, false, 0, e.message);
+                firoMapCache.set(date, new Map());
+                return firoMapCache.get(date);
+            }
+        };
+
+        let totalUpdated = 0;
+
+        // 4. 对 juhe 的每天，调 Firo ±1 天（应对开售/开赛日期差 1 天的情况）
+        for (const [date, matches] of dateGroups) {
+            console.log(`[syncOdds] Processing ${matches.length} matches for juhe date ${date}...`);
+
+            // 加载 ±1 天的 Firo 数据（开售日期通常比开赛早 1 天）
+            const datesToFetch = [addDays(date, -1), date, addDays(date, 1)];
+            const firoMaps = [];
+            for (const d of datesToFetch) {
+                const m = await loadFiroDate(d);
+                firoMaps.push(m);
+            }
+            const totalFiroMatches = firoMaps.reduce((sum, m) => sum + m.size, 0);
+            console.log(`[syncOdds] Firo data for ${datesToFetch.join(',')}: ${totalFiroMatches} matches`);
+
+            // 4.3 对每个 juheMatches 找对应 firo matchId 并写入赔率
+            let debugFound = 0, debugNoLottery = 0, debugNoFiro = 0, debugFallback = 0;
+            for (const jr of matches) {
+                try {
+                    // 在 lottery_jc_matches 中查找（主队/客队/时间 ±1h）
+                    const { results: lotteryRows } = await env.DB.prepare(`
+                        SELECT match_id, odds FROM lottery_jc_matches
+                        WHERE home_team = ? AND away_team = ?
+                          AND match_time IS NOT NULL
+                          AND ABS(strftime('%s', match_time) - strftime('%s', ?)) <= 3600
+                          AND match_id IS NOT NULL
+                          AND odds IS NOT NULL AND odds != ''
+                        LIMIT 1
+                    `).bind(jr.home_team, jr.away_team, jr.match_time).all();
+
+                    let firoMatchId = null;
+                    let source = null;
+                    let lotteryOddsJson = null;
+                    if (lotteryRows && lotteryRows.length > 0) {
+                        firoMatchId = lotteryRows[0].match_id;
+                        source = 'JC';
+                        lotteryOddsJson = lotteryRows[0].odds;
+                    } else {
+                        // 试 BD 表
+                        const { results: bdRows } = await env.DB.prepare(`
+                            SELECT match_id, odds FROM lottery_bd_matches
+                            WHERE home_team = ? AND away_team = ?
+                              AND match_time IS NOT NULL
+                              AND ABS(strftime('%s', match_time) - strftime('%s', ?)) <= 3600
+                              AND match_id IS NOT NULL
+                              AND odds IS NOT NULL AND odds != ''
+                            LIMIT 1
+                        `).bind(jr.home_team, jr.away_team, jr.match_time).all();
+                        if (bdRows && bdRows.length > 0) {
+                            firoMatchId = bdRows[0].match_id;
+                            source = 'BD';
+                            lotteryOddsJson = bdRows[0].odds;
+                        }
+                    }
+
+                    if (!firoMatchId) {
+                        debugNoLottery++;
+                        continue; // 未在 lottery 表中找到
+                    }
+
+                    // 在 firoMaps 中找（matchId 跨日期去重）
+                    let oddsData = null;
+                    for (const m of firoMaps) {
+                        if (m.has(firoMatchId)) {
+                            oddsData = m.get(firoMatchId);
+                            break;
+                        }
+                    }
+
+                    let oddsJson = null;
+                    if (oddsData && oddsData.oddsList && oddsData.oddsList.length > 0) {
+                        // 首选：Firo 实时数据
+                        oddsJson = JSON.stringify({
+                            source,
+                            firoMatchId,
+                            homeTeam: oddsData.homeTeam,
+                            awayTeam: oddsData.awayTeam,
+                            matchTime: `${oddsData.matchStartDate}T${oddsData.matchTime || '00:00'}:00Z`,
+                            oddsList: oddsData.oddsList,
+                            syncedAt: new Date().toISOString()
+                        });
+                        debugFound++;
+                    } else if (lotteryOddsJson) {
+                        // Fallback：Firo 没返回时，用 lottery 表的 odds（已开赛/已过期比赛用历史赔率）
+                        try {
+                            const parsed = JSON.parse(lotteryOddsJson);
+                            // 统一为 oddsList 数组格式
+                            const oddsList = [];
+                            if (Array.isArray(parsed.oddsResults) && parsed.oddsResults.length > 0) {
+                                // lottery 表的 oddsResults 格式: {code, combination, goalLine, odds, poolId, ...}
+                                // 合并同 code 的 odds 到标准 pool
+                                const byCode = new Map();
+                                for (const r of parsed.oddsResults) {
+                                    const c = r.code;
+                                    if (!byCode.has(c)) byCode.set(c, { poolCode: c, goalLine: r.goalLine || '' });
+                                    const cur = byCode.get(c);
+                                    if (c === 'HAD' || c === 'HHAD' || c === 'HAFU') {
+                                        if (r.combination === 'H' || r.combinationDesc === '胜') cur.homeOdds = r.odds;
+                                        else if (r.combination === 'D' || r.combinationDesc === '平') cur.drawOdds = r.odds;
+                                        else if (r.combination === 'A' || r.combinationDesc === '负') cur.awayOdds = r.odds;
+                                    } else {
+                                        // TTG/CRS 等单一组合池：附加在 description
+                                        cur.combination = r.combination;
+                                        cur.combinationDesc = r.combinationDesc;
+                                        cur.odds = r.odds;
+                                    }
+                                }
+                                for (const v of byCode.values()) oddsList.push(v);
+                            } else if (parsed.h !== undefined) {
+                                // 简单 h/d/a 格式
+                                oddsList.push({
+                                    poolCode: 'HAD',
+                                    homeOdds: parseFloat(parsed.h),
+                                    drawOdds: parseFloat(parsed.d),
+                                    awayOdds: parseFloat(parsed.a),
+                                    goalLine: parsed.goalLine || ''
+                                });
+                            } else if (Array.isArray(parsed)) {
+                                // 已经是 array 格式（Firo 同款）
+                                for (const p of parsed) oddsList.push(p);
+                            }
+
+                            if (oddsList.length === 0) {
+                                debugNoFiro++;
+                                continue;
+                            }
+
+                            oddsJson = JSON.stringify({
+                                source,
+                                firoMatchId,
+                                homeTeam: jr.home_team,
+                                awayTeam: jr.away_team,
+                                matchTime: jr.match_time,
+                                oddsList,
+                                syncedAt: new Date().toISOString(),
+                                fallback: true
+                            });
+                            debugFallback++;
+                        } catch (e) {
+                            debugNoFiro++;
+                            continue;
+                        }
+                    } else {
+                        debugNoFiro++;
+                        continue; // Firo 没赔率，lottery 也没赔率（Define 状态）
+                    }
+
+                    // 4.4 写入 juhe_matches.odds
+                    await env.DB.prepare(`
+                        UPDATE juhe_matches SET odds = ? WHERE id = ?
+                    `).bind(oddsJson, jr.id).run();
+                    totalUpdated++;
+                } catch (e) {
+                    console.error(`[syncOdds] Error for match ${jr.id}:`, e.message);
+                }
+            }
+            console.log(`[syncOdds] Date ${date} debug: found=${debugFound}, noLottery=${debugNoLottery}, noFiro=${debugNoFiro}, fallback=${debugFallback}`);
+            // 把每日 debug 写入 sync_logs
+            await logSync(env, 'Odds-Debug', `Firo-${date}`, true, debugFound + debugFallback, `found=${debugFound}, noLottery=${debugNoLottery}, noFiro=${debugNoFiro}, fallback=${debugFallback}, firoMaps=${totalFiroMatches}`);
+        }
+
+        console.log(`[syncOdds] Updated odds for ${totalUpdated} juhe_matches records`);
+        await logSync(env, 'Odds', 'Firo', true, totalUpdated, `Updated ${totalUpdated} matches from ${dateGroups.size} days`);
+    } catch (e) {
+        console.error('Error in syncOddsFromFiro:', e.message);
+        await logSync(env, 'Odds', 'Firo', false, 0, e.message);
+    }
+};
+
 const dialectVoiceMap = {
     '上海话': { female: 'Jada' },
     '北京话': { male: 'Dylan' },
@@ -542,6 +836,35 @@ const fetchTodayMatches = async (env) => {
     }
 };
 
+/**
+ * 统一的同步日志记录函数
+ * 用于所有 sync 任务的成功/失败记录
+ * @param env Worker env
+ * @param syncType 同步类型：'BD' | 'JC' | 'WorldcupNews' | 'WorldCup' | 'Renjiu' 等
+ * @param source 数据源：'Firo' | 'Juhe-Key1' | 'Juhe-All' 等
+ * @param success 是否成功（true/false）
+ * @param count 处理条数（可选）
+ * @param errorMsg 错误消息（可选）
+ * @param errorCode 错误码（可选，如 10012）
+ */
+const logSync = async (env, syncType, source, success, count = 0, errorMsg = null, errorCode = null) => {
+    try {
+        const msg = errorMsg ? `${errorCode ? `[${errorCode}] ` : ''}${errorMsg}` : null;
+        await env.DB.prepare(
+            `INSERT INTO sync_logs (sync_type, draw_no, matches_count, source, success, error_msg) VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(
+            syncType,
+            'N/A',
+            count,
+            source,
+            success ? 1 : 0,
+            msg
+        ).run();
+    } catch (e) {
+        console.error(`[logSync] Failed to log sync for ${syncType}/${source}:`, e.message);
+    }
+};
+
 const saveMatchesToDb = async (env, matchesData, tableName = 'matches') => {
     if (!matchesData || matchesData.length === 0) return;
 
@@ -555,6 +878,8 @@ const saveMatchesToDb = async (env, matchesData, tableName = 'matches') => {
         const status = f.fixture?.status?.short || f.status;
         const homeLogo = f.teams?.home?.logo || f.home_logo;
         const awayLogo = f.teams?.away?.logo || f.away_logo;
+        const matchTypeDes = f.match_type_des || null;
+        const matchTypeName = f.match_type_name || null;
 
         // Delete existing record within 24 hours and re-insert with new data
         queries.push(
@@ -568,9 +893,9 @@ const saveMatchesToDb = async (env, matchesData, tableName = 'matches') => {
         // Insert new record
         queries.push(
             env.DB.prepare(`
-                INSERT INTO ${tableName} (home_team, away_team, match_time, league, score, status, home_logo, away_logo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `).bind(home, away, time, league, score, status, homeLogo, awayLogo)
+                INSERT INTO ${tableName} (home_team, away_team, match_time, league, score, status, home_logo, away_logo, match_type_des, match_type_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind(home, away, time, league, score, status, homeLogo, awayLogo, matchTypeDes, matchTypeName)
         );
     });
 
@@ -669,7 +994,7 @@ const getFlagUrlByLeague = (leagueName) => {
     return '';
 };
 
-const syncJuheMatches = async (env) => {
+const syncJuheMatches = async (env, options = {}) => {
     const leagues = ['yingchao', 'xijia', 'dejia', 'yijia', 'fajia', 'zhongchao'];
     const worldcupLeague = 'worldcup';
     const timeout = 120 * 1000;
@@ -682,20 +1007,22 @@ const syncJuheMatches = async (env) => {
     // Sync regular leagues
     for (const type of leagues) {
         let success = false;
-        
-        for (const juheKey of keys) {
+        let lastError = null;
+
+        for (let ki = 0; ki < keys.length; ki++) {
+            const juheKey = keys[ki];
             if (success) break;
-            
+
             try {
-                console.log(`Syncing Juhe league: ${type} with key: ${juheKey.substring(0, 8)}...`);
+                console.log(`Syncing Juhe league: ${type} with key #${ki+1}: ${juheKey.substring(0, 8)}...`);
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), timeout);
-                
+
                 const response = await fetch(`http://apis.juhe.cn/fapig/football/query?key=${juheKey}&type=${type}`, {
                     signal: controller.signal
                 });
                 clearTimeout(timeoutId);
-                
+
                 const data = await response.json();
 
                 if (data.error_code === 0 && data.result && data.result.matchs) {
@@ -705,7 +1032,7 @@ const syncJuheMatches = async (env) => {
                             const score1 = m.team1_score || '-';
                             const score2 = m.team2_score || '-';
                             const score = `${score1} - ${score2}`;
-                            
+
                             matches.push({
                                 home: m.team1,
                                 away: m.team2,
@@ -721,71 +1048,89 @@ const syncJuheMatches = async (env) => {
                     await saveMatchesToDb(env, matches, 'juhe_matches');
                     success = true;
                     console.log(`Successfully synced ${matches.length} matches for ${type}`);
+                    await logSync(env, 'League', `Juhe-Key${ki+1}`, true, matches.length, `League: ${type}`);
                 } else if (data.error_code === 10012) {
-                    console.log(`API key ${juheKey.substring(0, 8)} quota exceeded, trying next key...`);
+                    console.log(`API key #${ki+1} ${juheKey.substring(0, 8)} quota exceeded, trying next key...`);
+                    await logSync(env, 'League', `Juhe-Key${ki+1}`, false, 0, `League ${type} quota exceeded`, 10012);
+                    lastError = `quota exceeded (10012)`;
                 } else {
                     console.log(`API error for ${type}: ${data.reason}`);
+                    await logSync(env, 'League', `Juhe-Key${ki+1}`, false, 0, `League ${type}: ${data.reason || 'unknown'}`, data.error_code);
+                    lastError = data.reason || `error_code ${data.error_code}`;
                 }
             } catch (e) {
-                console.error(`Error syncing Juhe league ${type}:`, e);
+                console.error(`Error syncing Juhe league ${type} with key #${ki+1}:`, e.message);
+                await logSync(env, 'League', `Juhe-Key${ki+1}`, false, 0, `League ${type} network: ${e.message}`);
+                lastError = `network: ${e.message}`;
             }
         }
-        
+
         if (!success) {
             console.log(`Failed to sync ${type} with all available keys`);
+            await logSync(env, 'League', 'Juhe-All', false, 0, `League ${type} all keys failed: ${lastError}`);
         }
     }
     
-    // Sync World Cup using dedicated API (id=616)
+    // Sync World Cup using dedicated API (id=616) with key pool fallback
     console.log(`Syncing World Cup matches...`);
     let worldcupSuccess = false;
-    
-    const worldcupKey = env.WORLDCUP_API_KEY;
-    
-    if (!worldcupKey) {
-        console.log(`World Cup API key not configured, skipping...`);
-    } else {
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), timeout);
-            
-            // World Cup API endpoint (id=616)
-            const response = await fetch(`https://apis.juhe.cn/fapigw/worldcup2026/schedule?key=${worldcupKey}`, {
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-            
-            const data = await response.json();
-            
-            console.log(`World Cup API response keys: ${Object.keys(data).join(', ')}`);
-            console.log(`World Cup API result keys: ${data.result ? Object.keys(data.result).join(', ') : 'null'}`);
 
-            if (data.error_code === 0 && data.result) {
-                const matches = [];
-                const scheduleList = data.result.data || [];
-                
-                console.log(`Found ${scheduleList.length} schedule groups from World Cup API`);
-                
-                scheduleList.forEach(dayGroup => {
-                     const dayMatches = dayGroup.schedule_list || [];
-                     dayMatches.forEach(m => {
-                         // Skip matches where teams are not determined yet
-                         // Contains "胜者", "败者", "/" (group combination), or single letter + number pattern
-                         if (m.host_team_name.includes('胜者') || m.guest_team_name.includes('胜者') ||
-                             m.host_team_name.includes('败者') || m.guest_team_name.includes('败者') ||
-                             m.host_team_name.includes('/') || m.guest_team_name.includes('/') ||
-                             /^[A-Z]\d?$/.test(m.host_team_name) || /^[A-Z]\d?$/.test(m.guest_team_name)) {
-                             return;
-                         }
-                         
-                         const status = m.match_status === '1' ? '未开赛' : 
-                                        m.match_status === '2' ? '比赛中' : 
-                                        m.match_status === '3' ? '完赛' : m.match_des || '未知';
-                         
-                         // Convert date_time "2026-07-03 07:00:00" to "2026-07-03T07:00:00Z"
-                         const matchDate = m.date_time ? m.date_time.replace(' ', 'T') + 'Z' : `${m.date}T00:00:00Z`;
-                         
-                         matches.push({
+    const worldcupKeys = getWorldcupApiKeys(env);
+
+    if (worldcupKeys.length === 0) {
+        console.log(`World Cup API keys not configured, skipping...`);
+    } else {
+        // Try each key in order, fallback on rate limit
+        for (let ki = 0; ki < worldcupKeys.length && !worldcupSuccess; ki++) {
+            const worldcupKey = worldcupKeys[ki];
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+                // World Cup API endpoint (id=616)
+                const response = await fetch(`https://apis.juhe.cn/fapigw/worldcup2026/schedule?key=${worldcupKey}`, {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+
+                const data = await response.json();
+
+                // 限流 (10012) 时切换下一个 key
+                if (data.error_code === 10012 || data.error_code === 10001) {
+                    console.log(`World Cup schedule key #${ki+1} rate limited (${data.error_code}), trying next...`);
+                    await logSync(env, 'WorldCup', `Juhe-Key${ki+1}`, false, 0, data.reason || 'rate limited', data.error_code);
+                    continue;
+                }
+
+                console.log(`World Cup API (key #${ki+1}) response keys: ${Object.keys(data).join(', ')}`);
+                console.log(`World Cup API result keys: ${data.result ? Object.keys(data.result).join(', ') : 'null'}`);
+
+                if (data.error_code === 0 && data.result) {
+                    const matches = [];
+                    const scheduleList = data.result.data || [];
+
+                    console.log(`Found ${scheduleList.length} schedule groups from World Cup API`);
+
+                    scheduleList.forEach(dayGroup => {
+                         const dayMatches = dayGroup.schedule_list || [];
+                         dayMatches.forEach(m => {
+                             // Skip matches where teams are not determined yet
+                             // Contains "胜者", "败者", "/" (group combination), or single letter + number pattern
+                             if (m.host_team_name.includes('胜者') || m.guest_team_name.includes('胜者') ||
+                                 m.host_team_name.includes('败者') || m.guest_team_name.includes('败者') ||
+                                 m.host_team_name.includes('/') || m.guest_team_name.includes('/') ||
+                                 /^[A-Z]\d?$/.test(m.host_team_name) || /^[A-Z]\d?$/.test(m.guest_team_name)) {
+                                 return;
+                             }
+
+                             const status = m.match_status === '1' ? '未开赛' :
+                                            m.match_status === '2' ? '比赛中' :
+                                            m.match_status === '3' ? '完赛' : m.match_des || '未知';
+
+                             // Convert date_time "2026-07-03 07:00:00" to "2026-07-03T07:00:00Z"
+                             const matchDate = m.date_time ? m.date_time.replace(' ', 'T') + 'Z' : `${m.date}T00:00:00Z`;
+
+                             matches.push({
                              home: m.host_team_name,
                              away: m.guest_team_name,
                              home_logo: getFlagUrl(m.host_team_name),
@@ -793,11 +1138,13 @@ const syncJuheMatches = async (env) => {
                              league: '世界杯',
                              date: matchDate,
                              score: `${m.host_team_score || '-'}-${m.guest_team_score || '-'}`,
-                             status: status
+                             status: status,
+                             match_type_des: m.match_type_des || null,
+                             match_type_name: m.match_type_name || null
                          });
                      });
                  });
-                
+
                 console.log(`Prepared ${matches.length} World Cup matches to save`);
                 if (matches.length > 0) {
                     console.log(`First match: ${JSON.stringify(matches[0])}`);
@@ -806,86 +1153,194 @@ const syncJuheMatches = async (env) => {
                         await saveMatchesToDb(env, matches, 'juhe_matches');
                         worldcupSuccess = true;
                         console.log(`Successfully synced ${matches.length} World Cup matches`);
+                        await logSync(env, 'WorldCup', `Juhe-Key${ki+1}`, true, matches.length);
                     } catch (err) {
                         console.error(`Error in saveMatchesToDb: ${err.message}`);
                         console.error(err.stack);
+                        await logSync(env, 'WorldCup', `Juhe-Key${ki+1}`, false, 0, `saveMatchesToDb error: ${err.message}`);
                     }
                 } else {
                     console.log(`No World Cup matches found in API response`);
+                    await logSync(env, 'WorldCup', `Juhe-Key${ki+1}`, false, 0, 'No matches in response');
                 }
             } else {
                 console.log(`World Cup API error: ${data.reason || data.error_code}`);
+                await logSync(env, 'WorldCup', `Juhe-Key${ki+1}`, false, 0, data.reason || 'API error', data.error_code);
             }
-        } catch (e) {
-            console.error(`Error syncing World Cup:`, e.message);
-        }
-    }
-    
-    if (!worldcupSuccess) {
-        console.log(`Failed to sync World Cup`);
+            } catch (e) {
+                console.error(`Error syncing World Cup (key #${ki+1}):`, e.message);
+                // 网络错误时也尝试下一个 key
+                await logSync(env, 'WorldCup', `Juhe-Key${ki+1}`, false, 0, `Network error: ${e.message}`);
+            }
+        } // end for worldcupKeys
     }
 
-    // 同步世界杯资讯
-    await syncWorldcupNews(env);
+    if (!worldcupSuccess) {
+        console.log(`Failed to sync World Cup`);
+        await logSync(env, 'WorldCup', 'Juhe-All', false, 0, 'All keys exhausted or unavailable');
+    }
+
+    // 同步世界杯资讯（2 小时一次：只在偶数小时跑）
+    // 手动触发 /api/juhe/sync 时不调（避免与 /api/worldcup/news/sync 重复）
+    if (options.skipNews) {
+        console.log(`[syncJuheMatches] Skipping World Cup news sync (manual trigger)`);
+    } else {
+        const currentHour = new Date(Date.now() + 8 * 60 * 60 * 1000).getUTCHours();
+        // getUTCHours + 8 = 北京时间，2 % 2 = 0 表示偶数小时
+        if (currentHour % 2 === 0) {
+            await syncWorldcupNews(env);
+        } else {
+            console.log(`[World Cup news] Skipped (odd hour ${currentHour}, runs only at even hours)`);
+        }
+    }
 
     // 同步 lottery 表的 football_info 到 juhe_matches
     await syncFootballInfoToJuheMatches(env);
+
+    // 同步赔率（从 Firo）
+    await syncOddsFromFiro(env);
+};
+
+/**
+ * 获取世界杯 API key 池（自动去重有效 key）
+ * @param {Object} env - Cloudflare Workers env
+ * @returns {string[]} key 数组（按优先级排序）
+ */
+const getWorldcupApiKeys = (env) => {
+    const keys = [
+        env.WORLDCUP_API_KEY,
+        env.WORLDCUP_API_KEY_2,
+        env.WORLDCUP_API_KEY_3,
+        env.WORLDCUP_API_KEY_4
+    ].filter(k => k && k.trim().length > 0);
+    return keys;
 };
 
 /**
  * 同步世界杯资讯（juhe API id=616, endpoint=worldcup2026/news）
+ * 自动尝试 key 池：当前 key 限流时自动切换下一个
  */
 const syncWorldcupNews = async (env) => {
-    const worldcupKey = env.WORLDCUP_API_KEY;
-    if (!worldcupKey) {
+    const keys = getWorldcupApiKeys(env);
+    if (keys.length === 0) {
         console.log('World Cup news API key not configured, skipping...');
         return;
     }
 
-    try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 20000);
-        const response = await fetch(`https://apis.juhe.cn/fapigw/worldcup2026/news?key=${worldcupKey}&num=30`, {
-            signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        const data = await response.json();
+    // 读取上次成功的 key 索引（轮询机制）
+    const stateRow = await env.DB.prepare(
+        "SELECT value FROM app_state WHERE key = 'worldcup_news_key_index'"
+    ).first().catch(() => null);
+    const startIndex = stateRow ? parseInt(stateRow.value) % keys.length : 0;
 
-        if (data.error_code !== 0 || !data.result?.data) {
-            console.log(`World Cup news API error: ${data.reason || data.error_code}`);
+    // 顺序尝试每个 key（从轮询起点开始），遇到 10012 限流时切换下一个
+    for (let i = 0; i < keys.length; i++) {
+        const idx = (startIndex + i) % keys.length;
+        const worldcupKey = keys[idx];
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 20000);
+            const response = await fetch(`https://apis.juhe.cn/fapigw/worldcup2026/news?key=${worldcupKey}&num=30`, {
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            const data = await response.json();
+
+            // 限流 (10012) 或错误 10001 时切换下一个 key
+            if (data.error_code === 10012 || data.error_code === 10001) {
+                console.log(`World Cup news key #${idx+1} rate limited (${data.error_code}), trying next...`);
+                continue;
+            }
+
+            if (data.error_code !== 0 || !data.result?.data) {
+                console.log(`World Cup news API error: ${data.reason || data.error_code}`);
+                try {
+                    await env.DB.prepare(
+                        `INSERT INTO sync_logs (sync_type, draw_no, matches_count, source, success, error_msg) VALUES (?, ?, ?, ?, 0, ?)`
+                    ).bind('WorldcupNews', 'N/A', 0, `Juhe-Key${idx+1}`, data.reason || 'unknown error').run();
+                } catch (e) {}
+                return;
+            }
+
+            const items = data.result.data;
+            console.log(`World Cup news (key #${idx+1}): fetched ${items.length} items`);
+
+            // 第一步：先 UPSERT 列表数据
+            const stmt = env.DB.prepare(`
+                INSERT INTO worldcup_news (id, title, img, publish_time, news_source)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    img = excluded.img,
+                    publish_time = excluded.publish_time,
+                    news_source = excluded.news_source
+            `);
+            const batch = items.map(n => stmt.bind(n.id, n.title, n.img || '', n.publish_time || '', n.news_source || ''));
+            await env.DB.batch(batch);
+
+            // 第二步：批量抓取详情（用 worldcup2026/newsinfo 端点，全小写）
+            let detailSuccess = 0;
+            let detailFailed = 0;
+            for (const item of items) {
+                try {
+                    const ctrl = new AbortController();
+                    const tmid = setTimeout(() => ctrl.abort(), 8000);
+                    const detailResp = await fetch(`https://apis.juhe.cn/fapigw/worldcup2026/newsinfo?key=${worldcupKey}&id=${item.id}`, {
+                        signal: ctrl.signal
+                    });
+                    clearTimeout(tmid);
+                    const detailData = await detailResp.json();
+
+                    if (detailData.error_code === 10012 || detailData.error_code === 10001) {
+                        // 当前 key 限流，跳过详情抓取
+                        console.log(`World Cup news detail: key #${idx+1} rate limited (${detailData.error_code}), skipping details`);
+                        await logSync(env, 'WorldcupNews', `Juhe-Key${idx+1}-detail`, false, detailSuccess, `Detail rate limited, ${detailFailed} failed`, detailData.error_code);
+                        break;
+                    }
+
+                    if (detailData.error_code === 0 && detailData.result?.data?.content) {
+                        const content = detailData.result.data.content;
+                        await env.DB.prepare(`
+                            UPDATE worldcup_news SET content = ? WHERE id = ?
+                        `).bind(content, item.id).run();
+                        detailSuccess++;
+                    } else {
+                        detailFailed++;
+                    }
+                } catch (e) {
+                    detailFailed++;
+                }
+            }
+            console.log(`World Cup news detail: ${detailSuccess} success, ${detailFailed} failed`);
+
+            // 记录主同步成功日志
+            await logSync(env, 'WorldcupNews', `Juhe-Key${idx+1}`, true, items.length, `${detailSuccess} with content, ${detailFailed} missing`);
+            console.log(`World Cup news synced: ${items.length} items, ${detailSuccess} with content`);
+
+            // 成功：更新下次轮询起点为下一个 key（均摊调用）
             try {
                 await env.DB.prepare(
-                    `INSERT INTO sync_logs (sync_type, draw_no, matches_count, source, success, error_msg) VALUES (?, ?, ?, ?, 0, ?)`
-                ).bind('WorldcupNews', 'N/A', 0, 'Juhe', data.reason || 'unknown error').run();
+                    "INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES ('worldcup_news_key_index', ?, datetime('now'))"
+                ).bind(String((idx + 1) % keys.length)).run();
             } catch (e) {}
-            return;
+
+            return; // 成功，退出
+        } catch (e) {
+            console.error(`World Cup news key #${idx+1} error:`, e.message);
+            // 网络错误时也尝试下一个 key
+            if (i === keys.length - 1) {
+                // 已是最后一个 key，记录失败日志
+                await logSync(env, 'WorldcupNews', 'Juhe-All', false, 0, e.message);
+                // 全部 key 失败，重置索引为 0
+                try {
+                    await env.DB.prepare(
+                        "INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES ('worldcup_news_key_index', '0', datetime('now'))"
+                    ).run();
+                } catch (e3) {}
+            }
         }
-
-        const items = data.result.data;
-        console.log(`World Cup news: fetched ${items.length} items`);
-
-        // UPSERT 到 worldcup_news 表（id 是主键，自动去重）
-        const stmt = env.DB.prepare(`
-            INSERT INTO worldcup_news (id, title, img, publish_time, news_source)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                title = excluded.title,
-                img = excluded.img,
-                publish_time = excluded.publish_time,
-                news_source = excluded.news_source
-        `);
-        const batch = items.map(n => stmt.bind(n.id, n.title, n.img || '', n.publish_time || '', n.news_source || ''));
-        await env.DB.batch(batch);
-
-        try {
-            await env.DB.prepare(
-                `INSERT INTO sync_logs (sync_type, draw_no, matches_count, source, success) VALUES (?, ?, ?, ?, 1)`
-            ).bind('WorldcupNews', 'N/A', items.length, 'Juhe').run();
-        } catch (e) {}
-        console.log(`World Cup news synced: ${items.length} items`);
-    } catch (e) {
-        console.error('Error syncing world cup news:', e.message);
     }
+    console.log('All World Cup news keys exhausted');
 };
 
 const fetchRenjiuPeriods = async () => {
@@ -1240,16 +1695,14 @@ export default {
     async scheduled(event, env, ctx) {
         const cron = event.crons?.[0] || '';
         console.log(`Cron job triggered: ${cron}`);
-        
+
         if (cron === '0 */4 * * *') {
-            console.log('Running 4-hour sync: Juhe matches...');
+            console.log('Running 4-hour sync: Juhe matches + Firo lottery (BD/JC) + match results + odds...');
             await syncJuheMatches(env);
-            console.log('4-hour sync completed.');
-        } else if (cron === '0 * * * *') {
-            console.log('Running hourly sync: Firo lottery (BD/JC) + match-results...');
             await syncFiroLottery(env);
             await syncFiroMatchResults(env);
-            console.log('Hourly sync completed.');
+            await syncOddsFromFiro(env);
+            console.log('4-hour sync completed.');
         } else {
             console.log('Running default sync...');
             const matchesData = await fetchTodayMatches(env);
@@ -1620,7 +2073,10 @@ export default {
                             league: r.league,
                             date: r.match_time,
                             score: score,
-                            status: r.status
+                            status: r.status,
+                            odds: r.odds ? JSON.parse(r.odds) : null,
+                            match_type_des: r.match_type_des || null,
+                            match_type_name: r.match_type_name || null
                         };
                     })
                 );
@@ -2746,13 +3202,13 @@ export default {
                 const countResult = await env.DB.prepare(`SELECT COUNT(*) as total FROM worldcup_news`).first();
                 const total = countResult.total;
                 const { results } = await env.DB.prepare(
-                    `SELECT id, title, img, publish_time, news_source, created_at
+                    `SELECT id, title, img, publish_time, news_source, content, created_at
                      FROM worldcup_news
                      ORDER BY publish_time DESC, id DESC
                      LIMIT ? OFFSET ?`
                 ).bind(pageSize, offset).all();
 
-                // ⚠️ juhe worldcup2026/news 接口不返回 content 字段，详情接口未公开
+                // ✅ juhe 详情接口为 worldcup2026/newsinfo（全小写）+ id 参数
                 // 这里动态生成 search_url 让前端跳转到百度搜索原文
                 const enriched = results.map(n => ({
                     ...n,
@@ -2784,6 +3240,7 @@ export default {
                 });
             }
             try {
+                // 直接调 syncWorldcupNews（不受偶数小时限制）
                 await syncWorldcupNews(env);
                 const countResult = await env.DB.prepare(`SELECT COUNT(*) as total FROM worldcup_news`).first();
                 return new Response(JSON.stringify({
@@ -2835,13 +3292,37 @@ export default {
 
             try {
                 console.log('Manual sync triggered for Juhe matches...');
-                await syncJuheMatches(env);
+                // 手动触发时跳过 news 同步，避免与 /api/worldcup/news/sync 重复
+                await syncJuheMatches(env, { skipNews: true });
                 return new Response(JSON.stringify({ message: 'Juhe sync completed successfully' }), {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
             } catch (e) {
                 console.error('Juhe sync error:', e);
                 return new Response(JSON.stringify({ error: 'Juhe sync failed', details: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        if (url.pathname === '/api/juhe/odds/sync') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            try {
+                console.log('Manual sync triggered for odds from Firo...');
+                await syncOddsFromFiro(env);
+                return new Response(JSON.stringify({ message: 'Odds sync completed' }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                console.error('Odds sync error:', e);
+                return new Response(JSON.stringify({ error: 'Odds sync failed', details: e.message }), {
                     status: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
