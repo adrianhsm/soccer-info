@@ -75,6 +75,69 @@ const toolSearchWeb = async (env, query) => {
     }
 };
 
+// ====== aiWebSearch：用 MiniMax M3 web_search server-side tool ======
+// 之前 syncJcMatchesViaAI_qwenFallback 里的 qwenWebSearch 删了，但 toolSearchWeb 还在调用
+// 重新实现：用 M3 的 {type:'web_search'} server-side tool（MiniMax 原生支持）
+const aiWebSearch = async (env, query) => {
+    if (!env.MINIMAX_API_KEY) {
+        throw new Error('MINIMAX_API_KEY not configured');
+    }
+    const baseURL = (env.MINIMAX_API_HOST || 'https://api.minimaxi.com') + '/v1';
+    // 先试 M3 + web_search
+    try {
+        const r = await fetch(`${baseURL}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${env.MINIMAX_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: 'MiniMax-M3',
+                messages: [
+                    { role: 'system', content: '你是联网搜索助手，根据用户 query 搜索并总结结果。' },
+                    { role: 'user', content: query }
+                ],
+                tools: [{ type: 'web_search' }],
+                max_tokens: 4000,
+                temperature: 0.1
+            })
+        });
+        if (r.ok) {
+            const data = await r.json();
+            const content = data.choices?.[0]?.message?.content;
+            if (content) return content;
+        }
+        // M3 web_search 失败，fallback 到 Qwen
+    } catch (e) {
+        console.log(`[aiWebSearch] M3 web_search failed: ${e.message}, fallback Qwen`);
+    }
+    // Fallback: Qwen 联网搜索
+    if (env.QWEN_API_KEY) {
+        const r2 = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${env.QWEN_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: 'qwen3-max',
+                messages: [
+                    { role: 'system', content: '你是联网搜索助手。' },
+                    { role: 'user', content: query }
+                ],
+                tools: [{ type: 'web_search' }],
+                max_tokens: 4000
+            })
+        });
+        if (r2.ok) {
+            const data = await r2.json();
+            return data.choices?.[0]?.message?.content || JSON.stringify(data).substring(0, 2000);
+        }
+        throw new Error(`Qwen web_search ${r2.status}: ${(await r2.text()).substring(0, 200)}`);
+    }
+    throw new Error('Both M3 and Qwen web_search failed and no QWEN_API_KEY fallback');
+};
+
 // M3 工具定义（OpenAI function calling 格式）
 const M3_TOOLS_SCHEMA = [
     {
@@ -3639,6 +3702,13 @@ export default {
             if (secret !== env.API_SECRET) {
                 return new Response(JSON.stringify({ error: 'Forbidden' }), {
                     status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            // debug 模式：返回 fetch_500 实际抓到的 matchesBlock
+            if (url.searchParams.get('debug') === '500') {
+                const debug = await toolFetch500(env);
+                return new Response(JSON.stringify(debug, null, 2), {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
             }
