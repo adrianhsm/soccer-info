@@ -36,25 +36,26 @@ const toolFetch500 = async (env) => {
                     }
                     if (text.length > 5000) {
                         // 提取比赛行：500.com 用 class="bet_table" 包含每场比赛
-                        // 简化：取所有含"vs"或"VS"的中文行 + 前后的 match_id/league
+                        // 扩大窗口到 18 行：match_id 在第 1 行，赔率在 5-12 行（h/d/a）
                         const lines = text.split('\n');
                         const matchLines = [];
                         for (let i = 0; i < lines.length; i++) {
                             if (/周[一二三四五六日]\d{3}/.test(lines[i])) {
-                                // match_id 行
-                                matchLines.push(lines.slice(Math.max(0, i - 1), Math.min(lines.length, i + 5)).join(' '));
+                                matchLines.push({
+                                    idx: i,
+                                    block: lines.slice(Math.max(0, i - 1), Math.min(lines.length, i + 18)).join(' ').replace(/\s+/g, ' ').trim()
+                                });
                             }
                         }
-                        // 同时也截取关键 HTML 段（table 区域）
-                        const tableMatch = text.match(/<table[^>]*class="[^"]*(?:bet_list|bet_table|matches)[^"]*"[\s\S]{0,8000}?<\/table>/gi);
-                        const tableSnippet = tableMatch ? tableMatch.join('\n').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').substring(0, 4000) : '';
+                        // 取全部 matchLines 拼成大块给 M3
+                        const matchesBlock = matchLines.slice(0, 20).map(m => m.block).join('\n\n---NEXT MATCH---\n\n');
                         return {
                             ok: true,
                             source: `500.com${path}`,
                             totalLength: text.length,
-                            matchLines: matchLines.slice(0, 20).join('\n'),
-                            tableSnippet: tableSnippet || 'no table found',
-                            sample: text.substring(0, 2000)
+                            matchCount: matchLines.length,
+                            matchesBlock: matchesBlock.substring(0, 12000),
+                            sample: text.substring(0, 1500)
                         };
                     }
                 }
@@ -138,22 +139,26 @@ const syncJcMatchesViaM3Agent = async (env) => {
             role: 'system',
             content: `你是中国体育彩票竞彩足球数据查询专家。任务：使用工具获取今天(${today})和明天(${tomorrow})中国体彩中心"竞彩足球"在售的全部比赛。
 
-要求：
-1. 优先使用 fetch_500 工具直接拉取 500.com 实时数据（最权威）
+**绝对要求（违反会出错）**：
+1. 优先使用 fetch_500 工具直接拉取 500.com 实时数据（最权威，HTML 中含赔率）
 2. 如 500 失败，使用 search_web 工具用 M3/Qwen 联网搜索兜底
-3. 每场比赛必须有：matchNum(竞彩官方编号如"周二001")、league、home、away、matchTime
-4. 不要猜测 matchNum——如果工具没有返回，设为 null
-5. 至少尝试 2-3 个不同 query（今天/明天/本周）
-6. 最后输出 { matches: [...] } JSON 数组
+3. 每场比赛必须有：matchNum(竞彩官方编号如"周二001")、league、home、away、matchTime、odds
+4. odds 字段格式：{"h": 1.50, "d": 3.80, "a": 5.20}  分别是 主胜/平/客胜赔率
+5. 不要猜测赔率——如果工具没返回，odds 设为 null
+6. 不要猜测 matchNum——如果工具没有返回，设为 null
+7. 至少尝试 2-3 个不同 query（今天/明天/本周）
 
-注意：
-- 周X 是官方前缀（周一/周二/周三/周四/周五/周六/周日），后面跟 3 位数字编号
-- 主队在前客队在后
-- 时间用 ISO 格式 +08:00 时区`
+**输出格式（严格）**：
+- 最后**只能**输出一个 JSON 对象，格式：{"matches":[{"matchNum":"周二001","league":"...","home":"...","away":"...","matchTime":"2026-08-01T20:00:00+08:00","odds":{"h":1.50,"d":3.80,"a":5.20}}]}
+- **禁止**任何 think/思考/解释/说明文字
+- **禁止** \`\`\`json 代码块包裹
+- **禁止** 多个 JSON 对象
+- 直接以 { 开头 } 结尾
+- 如果 0 场比赛，输出 {"matches":[]}`
         },
         {
             role: 'user',
-            content: `请获取 ${today} 和 ${tomorrow} 中国竞彩足球在售的所有比赛，最终输出 JSON。`
+            content: `请获取 ${today} 和 ${tomorrow} 中国竞彩足球在售的所有比赛。最终只输出一个 JSON 对象（以 { 开头 } 结尾），不要任何其他文字。每场比赛必须包含 odds（主胜/平/客胜三个赔率）。`
         }
     ];
 
@@ -234,6 +239,42 @@ const syncJcMatchesViaM3Agent = async (env) => {
     const matches = (parsed.matches || []).filter(m => m && m.home && m.away);
     if (matches.length === 0) {
         return { error: 'Agent returned 0 matches', text: finalText.substring(0, 500), steps: step, stepsLog };
+    }
+
+    // odds fallback：缺赔率的比赛调 search_web 补查
+    const missingOdds = matches.filter(m => !m.odds || (m.odds.h == null && m.odds.d == null && m.odds.a == null));
+    if (missingOdds.length > 0) {
+        console.log(`[M3 Agent] ${missingOdds.length} matches missing odds, fallback search_web...`);
+        for (const m of missingOdds.slice(0, 5)) {  // 最多补 5 场，避免超时
+            try {
+                const query = `${m.matchNum || ''} ${m.home} vs ${m.away} 赔率 主胜 平 客胜`;
+                const content = await toolSearchWeb(env, query);
+                if (content.ok) {
+                    // 用 M3 提取赔率数字
+                    const extractPrompt = `从以下文本中提取 "${m.home} vs ${m.away}" 的竞彩赔率。
+返回 JSON 格式：{"h": 主胜赔率, "d": 平赔率, "a": 客胜赔率}，找不到字段填 null。
+只输出 JSON，不要其他文字。
+
+文本：
+${content.content.substring(0, 3000)}`;
+                    try {
+                        const oddsResp = await m3ChatCompletion(env, [
+                            { role: 'user', content: extractPrompt }
+                        ]);
+                        const oddsText = oddsResp.choices?.[0]?.message?.content || '';
+                        const oddsMatch = oddsText.match(/\{[\s\S]*?\}/);
+                        if (oddsMatch) {
+                            const odds = JSON.parse(oddsMatch[0]);
+                            m.odds = odds;
+                        }
+                    } catch (e) {
+                        console.error(`[M3 Agent] odds extract error: ${e.message}`);
+                    }
+                }
+            } catch (e) {
+                console.error(`[M3 Agent] odds fallback error: ${e.message}`);
+            }
+        }
     }
 
     // 写入 D1
