@@ -206,13 +206,14 @@ const syncJcMatchesViaM3Agent = async (env) => {
 1. 优先使用 fetch_500 工具直接拉取 500.com 实时数据（最权威，HTML 中含赔率）
 2. 如 500 失败，使用 search_web 工具用 M3/Qwen 联网搜索兜底
 3. 每场比赛必须有：matchNum(竞彩官方编号如"周二001")、league、home、away、matchTime、odds
-4. odds 字段格式：{"h": 1.50, "d": 3.80, "a": 5.20}  分别是 主胜/平/客胜赔率
-5. 不要猜测赔率——如果工具没返回，odds 设为 null
+4. odds 字段格式：必须是**对象** {"h": 1.50, "d": 3.80, "a": 5.20}（h=主胜, d=平, a=客胜）—— **不能是 []、不能是 "1.50"** 字符串、不能是 null
+5. 如果工具没返回赔率数据，odds 设为 **null**（**绝对不要写 []**）
 6. 不要猜测 matchNum——如果工具没有返回，设为 null
 7. 至少尝试 2-3 个不同 query（今天/明天/本周）
 
 **输出格式（严格）**：
 - 最后**只能**输出一个 JSON 对象，格式：{"matches":[{"matchNum":"周二001","league":"...","home":"...","away":"...","matchTime":"2026-08-01T20:00:00+08:00","odds":{"h":1.50,"d":3.80,"a":5.20}}]}
+- odds 必须是**对象**（key 是 h/d/a），不能是数组、字符串、null（除非完全没数据）
 - **禁止**任何 think/思考/解释/说明文字
 - **禁止** \`\`\`json 代码块包裹
 - **禁止** 多个 JSON 对象
@@ -305,7 +306,7 @@ const syncJcMatchesViaM3Agent = async (env) => {
     }
 
     // odds fallback：缺赔率的比赛调 search_web 补查
-    const missingOdds = matches.filter(m => !m.odds || (m.odds.h == null && m.odds.d == null && m.odds.a == null));
+    const missingOdds = matches.filter(m => !m.odds || typeof m.odds !== 'object' || Array.isArray(m.odds) || (m.odds.h == null && m.odds.d == null && m.odds.a == null));
     if (missingOdds.length > 0) {
         console.log(`[M3 Agent] ${missingOdds.length} matches missing odds, fallback search_web...`);
         for (const m of missingOdds.slice(0, 5)) {  // 最多补 5 场，避免超时
@@ -322,13 +323,17 @@ const syncJcMatchesViaM3Agent = async (env) => {
 ${content.content.substring(0, 3000)}`;
                     try {
                         const oddsResp = await m3ChatCompletion(env, [
+                            { role: 'system', content: '你是 JSON 数据提取助手。只输出 JSON 对象，不要任何解释。' },
                             { role: 'user', content: extractPrompt }
                         ]);
                         const oddsText = oddsResp.choices?.[0]?.message?.content || '';
                         const oddsMatch = oddsText.match(/\{[\s\S]*?\}/);
                         if (oddsMatch) {
-                            const odds = JSON.parse(oddsMatch[0]);
-                            m.odds = odds;
+                            const parsed = JSON.parse(oddsMatch[0]);
+                            // 必须是对象，且至少有 1 个字段
+                            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed.h != null || parsed.d != null || parsed.a != null)) {
+                                m.odds = parsed;
+                            }
                         }
                     } catch (e) {
                         console.error(`[M3 Agent] odds extract error: ${e.message}`);
