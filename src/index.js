@@ -349,10 +349,17 @@ ${content.content.substring(0, 3000)}`;
     let inserted = 0, sqlErrors = 0;
     for (const m of matches) {
         try {
-            const odds = m.odds ? JSON.stringify(m.odds) : null;
+            // odds 必须是有效对象（不是 null/数组/字符串）
+            const odds = (m.odds && typeof m.odds === 'object' && !Array.isArray(m.odds) && (m.odds.h != null || m.odds.d != null || m.odds.a != null))
+                ? JSON.stringify(m.odds) : null;
             let matchTime = m.matchTime || null;
             if (!matchTime && m.sellEndTime) {
                 matchTime = `${today}T${m.sellEndTime}:00+08:00`;
+            }
+            // 关键：转 SQLite datetime 格式，让 `match_time > datetime('now')` 过滤生效
+            // ISO "2026-08-01T20:00:00+08:00" → SQLite "2026-08-01 20:00:00"
+            if (matchTime && typeof matchTime === 'string') {
+                matchTime = matchTime.replace('T', ' ').replace(/\+\d{2}:\d{2}$/, '').replace(/Z$/, '');
             }
             await env.DB.prepare(`
                 INSERT OR IGNORE INTO lottery_jc_matches (home_team, away_team, match_time, league, score, status, odds, lottery_type, match_id)
