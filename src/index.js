@@ -1,3 +1,266 @@
+// ===== MiniMax M3 Multi-Step Agent（原生 fetch，OpenAI chat completions 兼容）=====
+// 说明：Vercel AI SDK 5+ 默认走 OpenAI Responses API，MiniMax 不支持。
+//       这里用原生 fetch 直接调 /v1/chat/completions，自己实现 multi-step tool_use loop。
+
+// 工具：fetch_500（500.com 列表页 HTML，GBK 解码）
+const toolFetch500 = async (env) => {
+    const paths = ['/jczq/', '/jczq/dg.shtml', '/jczq/issue.php'];
+    const uas = [
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    ];
+    for (const path of paths) {
+        for (const ua of uas) {
+            try {
+                const controller = new AbortController();
+                const tid = setTimeout(() => controller.abort(), 10_000);
+                const res = await fetch(`https://trade.500.com${path}`, {
+                    signal: controller.signal,
+                    headers: {
+                        'User-Agent': ua,
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                        'Referer': 'https://www.500.com/'
+                    }
+                });
+                clearTimeout(tid);
+                if (res.ok) {
+                    const buf = await res.arrayBuffer();
+                    // 关键：500.com HTML 是 GBK/GB2312 编码，必须手动解码
+                    let text;
+                    try {
+                        text = new TextDecoder('gbk', { fatal: false }).decode(buf);
+                    } catch (e) {
+                        text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+                    }
+                    if (text.length > 5000) {
+                        // 提取比赛行：500.com 用 class="bet_table" 包含每场比赛
+                        // 简化：取所有含"vs"或"VS"的中文行 + 前后的 match_id/league
+                        const lines = text.split('\n');
+                        const matchLines = [];
+                        for (let i = 0; i < lines.length; i++) {
+                            if (/周[一二三四五六日]\d{3}/.test(lines[i])) {
+                                // match_id 行
+                                matchLines.push(lines.slice(Math.max(0, i - 1), Math.min(lines.length, i + 5)).join(' '));
+                            }
+                        }
+                        // 同时也截取关键 HTML 段（table 区域）
+                        const tableMatch = text.match(/<table[^>]*class="[^"]*(?:bet_list|bet_table|matches)[^"]*"[\s\S]{0,8000}?<\/table>/gi);
+                        const tableSnippet = tableMatch ? tableMatch.join('\n').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').substring(0, 4000) : '';
+                        return {
+                            ok: true,
+                            source: `500.com${path}`,
+                            totalLength: text.length,
+                            matchLines: matchLines.slice(0, 20).join('\n'),
+                            tableSnippet: tableSnippet || 'no table found',
+                            sample: text.substring(0, 2000)
+                        };
+                    }
+                }
+            } catch (e) { /* try next */ }
+        }
+    }
+    return { ok: false, error: '500.com 全部 path/UA 失败' };
+};
+
+// 工具：search_web（用 M3/Qwen 联网搜索）
+const toolSearchWeb = async (env, query) => {
+    try {
+        const content = await aiWebSearch(env, query);
+        return { ok: true, source: 'ai-search', contentLength: content.length, content: content.substring(0, 6000) };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+};
+
+// M3 工具定义（OpenAI function calling 格式）
+const M3_TOOLS_SCHEMA = [
+    {
+        type: 'function',
+        function: {
+            name: 'fetch_500',
+            description: '直接拉取 500.com 竞彩足球列表页 HTML（最权威数据源，境外 IP 会被反爬）',
+            parameters: { type: 'object', properties: {}, required: [] }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'search_web',
+            description: '用 M3/Qwen 联网搜索查询竞彩比赛',
+            parameters: {
+                type: 'object',
+                properties: { query: { type: 'string', description: '搜索 query' } },
+                required: ['query']
+            }
+        }
+    }
+];
+
+// M3 chat completions API 调用（原生 fetch）
+const m3ChatCompletion = async (env, messages, tools = null) => {
+    const baseURL = (env.MINIMAX_API_HOST || 'https://api.minimaxi.com') + '/v1';
+    const body = {
+        model: 'MiniMax-M3',
+        messages,
+        max_tokens: 4000,
+        temperature: 0.1
+    };
+    if (tools) body.tools = tools;
+    const res = await fetch(`${baseURL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${env.MINIMAX_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`M3 chat ${res.status}: ${err.substring(0, 300)}`);
+    }
+    return await res.json();
+};
+
+// M3 多步 agent：自己实现 OpenAI 风格 tool_use 循环
+const syncJcMatchesViaM3Agent = async (env) => {
+    if (!env.MINIMAX_API_KEY) {
+        return { error: 'MINIMAX_API_KEY not configured' };
+    }
+    const now = new Date();
+    const today = now.toISOString().split('T')[0];
+    const tomorrow = new Date(now.getTime() + 86400000).toISOString().split('T')[0];
+    console.log(`[M3 Agent] start, target: ${today} ~ ${tomorrow}`);
+
+    const messages = [
+        {
+            role: 'system',
+            content: `你是中国体育彩票竞彩足球数据查询专家。任务：使用工具获取今天(${today})和明天(${tomorrow})中国体彩中心"竞彩足球"在售的全部比赛。
+
+要求：
+1. 优先使用 fetch_500 工具直接拉取 500.com 实时数据（最权威）
+2. 如 500 失败，使用 search_web 工具用 M3/Qwen 联网搜索兜底
+3. 每场比赛必须有：matchNum(竞彩官方编号如"周二001")、league、home、away、matchTime
+4. 不要猜测 matchNum——如果工具没有返回，设为 null
+5. 至少尝试 2-3 个不同 query（今天/明天/本周）
+6. 最后输出 { matches: [...] } JSON 数组
+
+注意：
+- 周X 是官方前缀（周一/周二/周三/周四/周五/周六/周日），后面跟 3 位数字编号
+- 主队在前客队在后
+- 时间用 ISO 格式 +08:00 时区`
+        },
+        {
+            role: 'user',
+            content: `请获取 ${today} 和 ${tomorrow} 中国竞彩足球在售的所有比赛，最终输出 JSON。`
+        }
+    ];
+
+    const maxSteps = 5;
+    let step = 0;
+    let finalText = '';
+    const stepsLog = [];
+
+    while (step < maxSteps) {
+        step++;
+        let resp;
+        try {
+            resp = await m3ChatCompletion(env, messages, M3_TOOLS_SCHEMA);
+        } catch (e) {
+            console.error(`[M3 Agent] step ${step} API error:`, e.message);
+            return { error: `M3 chat failed: ${e.message}`, step, steps: stepsLog };
+        }
+        const choice = resp.choices?.[0];
+        if (!choice) {
+            return { error: 'M3 returned no choice', resp: JSON.stringify(resp).substring(0, 500) };
+        }
+        const msg = choice.message || {};
+        const toolCalls = msg.tool_calls || [];
+        stepsLog.push({ step, content: msg.content?.substring(0, 200), toolCalls: toolCalls.map(t => t.function?.name) });
+        console.log(`[M3 Agent] step ${step}, tool_calls=${toolCalls.length}, content_len=${msg.content?.length || 0}`);
+
+        // 累加 assistant message（OpenAI 协议要求）
+        messages.push(msg);
+
+        if (toolCalls.length === 0) {
+            // 没有 tool call → final answer
+            finalText = msg.content || '';
+            break;
+        }
+
+        // 执行每个 tool call
+        for (const tc of toolCalls) {
+            const fnName = tc.function?.name;
+            let args = {};
+            try { args = JSON.parse(tc.function?.arguments || '{}'); } catch (e) { args = {}; }
+            let toolResult;
+            try {
+                if (fnName === 'fetch_500') {
+                    toolResult = await toolFetch500(env);
+                } else if (fnName === 'search_web') {
+                    toolResult = await toolSearchWeb(env, args.query || '');
+                } else {
+                    toolResult = { error: `Unknown tool: ${fnName}` };
+                }
+            } catch (e) {
+                toolResult = { error: e.message };
+            }
+            messages.push({
+                role: 'tool',
+                tool_call_id: tc.id,
+                content: JSON.stringify(toolResult).substring(0, 8000)
+            });
+        }
+    }
+    console.log(`[M3 Agent] done, steps=${step}, finalLen=${finalText.length}`);
+
+    // 解析 final text
+    const jsonMatch = finalText.match(/\{[\s\S]*?\}/);
+    if (!jsonMatch) {
+        return {
+            error: 'No JSON in final text',
+            text: finalText.substring(0, 1000),
+            steps: step,
+            stepsLog
+        };
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(jsonMatch[0]);
+    } catch (e) {
+        return { error: `JSON parse error: ${e.message}`, text: finalText.substring(0, 500), steps: step, stepsLog };
+    }
+    const matches = (parsed.matches || []).filter(m => m && m.home && m.away);
+    if (matches.length === 0) {
+        return { error: 'Agent returned 0 matches', text: finalText.substring(0, 500), steps: step, stepsLog };
+    }
+
+    // 写入 D1
+    let inserted = 0, sqlErrors = 0;
+    for (const m of matches) {
+        try {
+            const odds = m.odds ? JSON.stringify(m.odds) : null;
+            let matchTime = m.matchTime || null;
+            if (!matchTime && m.sellEndTime) {
+                matchTime = `${today}T${m.sellEndTime}:00+08:00`;
+            }
+            await env.DB.prepare(`
+                INSERT OR IGNORE INTO lottery_jc_matches (home_team, away_team, match_time, league, score, status, odds, lottery_type, match_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind(
+                m.home, m.away, matchTime, m.league || '竞彩', '- -', '未开售',
+                odds, '竞彩', m.matchNum || null
+            ).run();
+            inserted++;
+        } catch (e) {
+            sqlErrors++;
+            console.error(`[M3 Agent] insert error ${m.home} vs ${m.away}:`, e.message);
+        }
+    }
+    return { count: matches.length, inserted, errors: sqlErrors, steps: step, source: 'm3-agent-native' };
+};
+
 const styleRepaintMap = {
     '河北蔚县剪纸': 'hebeiweixianjianzhi.jpg',
     '天津杨柳青年画': 'tianjinyangliuqingnianhua.jpg',
@@ -1524,136 +1787,41 @@ const syncRenjiuMatches = async (env) => {
     }
 };
 
-// 抓取 live.500.com 完赛页原始 HTML（GBK 编码）
-const fetchLive500Html = async (timeoutMs = 120 * 1000) => {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const response = await fetch('https://live.500.com/wanchang.php', {
-            signal: controller.signal,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Referer': 'https://live.500.com/',
-                'Cache-Control': 'no-cache'
-            }
-        });
-        clearTimeout(tid);
-        if (!response.ok) throw new Error(`live.500.com HTTP ${response.status}`);
-        const buffer = await response.arrayBuffer();
-        return new TextDecoder('gbk').decode(buffer);
-    } catch (e) {
-        clearTimeout(tid);
-        throw e;
-    }
-};
-
-// 抓取 500.com 竞彩列表页原始 HTML（GBK 编码），带 retry
-const fetch500JcListHtml = async (timeoutMs = 15 * 1000) => {
-    const paths = ['/jczq/', '/jczq/dg.shtml', '/jczq/issue.php'];
-    const uaList = [
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    ];
-    let lastErr = null;
-    for (const path of paths) {
-        for (const ua of uaList) {
-            try {
-                const controller = new AbortController();
-                const tid = setTimeout(() => controller.abort(), timeoutMs);
-                const response = await fetch(`https://www.500.com${path}`, {
-                    signal: controller.signal,
-                    headers: {
-                        'User-Agent': ua,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                        'Referer': 'https://www.500.com/',
-                        'Cache-Control': 'no-cache',
-                        'Pragma': 'no-cache'
-                    }
-                });
-                clearTimeout(tid);
-                if (!response.ok) {
-                    lastErr = new Error(`500.com${path} HTTP ${response.status}`);
-                    continue;
-                }
-                const buffer = await response.arrayBuffer();
-                return { html: new TextDecoder('gbk').decode(buffer), source: `500.com${path}` };
-            } catch (e) {
-                lastErr = e;
-                try { clearTimeout(tid); } catch (_) {}
-            }
-        }
-    }
-    throw lastErr || new Error('500.com all paths failed');
-};
-
-// 抓取 okooo.com 竞彩列表页原始 HTML（UTF-8），带 retry
-const fetchOkoooJcListHtml = async (timeoutMs = 15 * 1000) => {
-    const paths = ['/jingcai/', '/jingcai/jingcai.shtml', '/jingcai/'];
-    const uaList = [
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
-    ];
-    let lastErr = null;
-    for (const path of paths) {
-        for (const ua of uaList) {
-            try {
-                const controller = new AbortController();
-                const tid = setTimeout(() => controller.abort(), timeoutMs);
-                const response = await fetch(`https://www.okooo.com${path}`, {
-                    signal: controller.signal,
-                    headers: {
-                        'User-Agent': ua,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                        'Referer': 'https://www.okooo.com/',
-                        'Cache-Control': 'no-cache',
-                        'Pragma': 'no-cache'
-                    }
-                });
-                clearTimeout(tid);
-                if (!response.ok) {
-                    lastErr = new Error(`okooo.com${path} HTTP ${response.status}`);
-                    continue;
-                }
-                const text = await response.text();
-                return { html: text, source: `okooo.com${path}` };
-            } catch (e) {
-                lastErr = e;
-                try { clearTimeout(tid); } catch (_) {}
-            }
-        }
-    }
-    throw lastErr || new Error('okooo.com all paths failed');
-};
-
 const fetchLive500Matches = async () => {
     try {
-        const html = await fetchLive500Html();
-
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 120 * 1000);
+        
+        const response = await fetch('https://live.500.com/wanchang.php', {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) return [];
+        
+        const buffer = await response.arrayBuffer();
+        const decoder = new TextDecoder('gbk');
+        const html = decoder.decode(buffer);
+        
         const matches = [];
-
+        
         const trRegex = /<tr[^>]*gy=["']([^"']*)["'][^>]*>([\s\S]*?)<\/tr>/g;
         let trMatch;
-
+        
         while ((trMatch = trRegex.exec(html)) !== null) {
             const gyInfo = trMatch[1];
             const trContent = trMatch[2];
-
+            
             const homeMatch = trContent.match(/<span class="mainName"[^>]*>([^<]*)<\/span>/);
             const awayMatch = trContent.match(/<span class="clientName"[^>]*>([^<]*)<\/span>/);
-
+            
             const scoreMatch = trContent.match(/<td[^>]*class="red"[^>]*>([\d\s-]+)<\/td>/);
-
+            
             if (homeMatch && awayMatch && scoreMatch) {
                 const homeTeam = homeMatch[1].trim();
                 const awayTeam = awayMatch[1].trim();
                 const score = scoreMatch[1].trim();
-
+                
                 if (homeTeam && awayTeam && score && score.match(/\d+\s*-\s*\d+/)) {
                     matches.push({
                         home: homeTeam,
@@ -1663,7 +1831,7 @@ const fetchLive500Matches = async () => {
                 }
             }
         }
-
+        
         console.log(`Fetched ${matches.length} matches from live.500.com`);
         return matches;
     } catch (e) {
@@ -1672,450 +1840,46 @@ const fetchLive500Matches = async () => {
     }
 };
 
-// ===== Qwen 联网搜索（兜底）=====
-const qwenWebSearch = async (env, query, model = 'qwen3-max') => {
-    const res = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${env.QWEN_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model,
-            messages: [
-                { role: 'system', content: '你是中文体育数据查询助手。' },
-                { role: 'user', content: query }
-            ],
-            // DashScope 联网搜索参数（需在控制台开通 enable_search）
-            enable_search: true,
-            search_options: {
-                forced_search: true,
-                search_strategy: 'standard'
-            }
-        })
-    });
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`Qwen search ${res.status}: ${err.substring(0, 200)}`);
-    }
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || '';
-};
-
-// ===== MiniMax M3 联网搜索（chatcompletion_v2 + web_search tool）=====
-const minimaxWebSearch = async (env, query) => {
-    if (!env.MINIMAX_API_KEY) {
-        throw new Error('MINIMAX_API_KEY not configured');
-    }
-    // 国内 / 海外 endpoint 切换（默认海外 api.minimax.io）
-    const base = env.MINIMAX_API_HOST || 'https://api.minimax.io';
-    const url = `${base}/v1/text/chatcompletion_v2`;
-    const body = {
-        model: 'MiniMax-M3',
-        messages: [
-            { role: 'system', content: '你是中文体育数据查询助手。根据用户问题搜索网络后，提取结构化 JSON 数据。' },
-            { role: 'user', content: query }
-        ],
-        tools: [{ type: 'web_search' }],
-        tool_choice: 'auto',
-        max_tokens: 4096,
-        temperature: 0.1
-    };
-    let res;
-    try {
-        res = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${env.MINIMAX_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(body)
-        });
-    } catch (e) {
-        throw new Error(`MiniMax fetch error: ${e.message}`);
-    }
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`MiniMax ${res.status}: ${err.substring(0, 300)}`);
-    }
-    const data = await res.json();
-    // M3 多轮 function call：tool_calls 里有 web_search 调用 → 拿 assistant 完整 content（含搜索结果摘要）
-    const choice = data.choices?.[0];
-    if (!choice) throw new Error('MiniMax returned no choice');
-    const msg = choice.message || {};
-    let content = msg.content || '';
-    // 工具调用可能还有第二轮返回（tool role），先看 assistant 的 content
-    // 如果是 base_resp 内错误
-    if (data.base_resp && data.base_resp.status_code !== 0) {
-        throw new Error(`MiniMax base_resp error: ${JSON.stringify(data.base_resp)}`);
-    }
-    return content;
-};
-
-// ===== AI 同步 JC 名单（500.com/jczq/）=====
-const syncJcMatchesViaAI = async (env) => {
-    if (!env.QWEN_API_KEY) {
-        console.log('QWEN_API_KEY not configured, skip AI JC list sync');
-        return { skipped: true, reason: 'no QWEN_API_KEY' };
-    }
-    console.log('AI syncing JC match list...');
-
-    // 方案 1：抓 500.com/jczq/ HTML
-    let html = null, source = null, err1 = null;
-    try {
-        const r = await fetch500JcListHtml();
-        html = r.html;
-        source = r.source;
-    } catch (e) {
-        err1 = e.message;
-        console.warn('fetch500JcListHtml failed:', err1);
-    }
-
-    // 方案 1.5：500.com 失败时试 okooo.com/jingcai/
-    if (!html) {
-        console.log('500.com failed, trying okooo.com/jingcai/...');
-        try {
-            const r = await fetchOkoooJcListHtml();
-            html = r.html;
-            source = r.source;
-        } catch (e) {
-            console.warn('fetchOkoooJcListHtml failed:', e.message);
-        }
-    }
-
-    if (html) {
-        let result;
-        try {
-            result = await aiExtractFromHtml(env, html,
-                `从 500.com / okooo.com 竞彩足球列表页提取所有竞彩比赛信息。每场比赛包含 matchNum（编号如"周日001"）、league（联赛名）、home（主队名）、away（客队名）、matchTime（停售时间，格式 YYYY-MM-DDTHH:mm:ss+08:00 或 ISO）、sellEndTime（停售时刻 HH:mm）、odds（胜平负赔率对象 {h,d,a}）、handicap（让球数如有）。如果提取不到某字段，设为 null。`,
-                {
-                    matches: [
-                        { matchNum: '周日001', league: '英超', home: '曼彻斯特联', away: '切尔西', matchTime: '2026-07-15T20:00:00+08:00', sellEndTime: '20:00', handicap: '-1', odds: { h: 1.85, d: 3.40, a: 4.20 } }
-                    ]
-                }
-            );
-        } catch (e) {
-            console.error(`aiExtractFromHtml failed for ${source}:`, e.message);
-            // okooo 等 HTML 解析失败也回退 Qwen
-            return await syncJcMatchesViaAI_qwenFallback(env, err1);
-        }
-        const matches = (result.matches || []).filter(m => m && m.home && m.away);
-        console.log(`AI extracted ${matches.length} JC matches from ${source}`);
-        // 关键改动：okooo 0 场也回退 Qwen
-        if (matches.length === 0 && source.startsWith('okooo.')) {
-            console.log(`okooo returned 0 matches, falling back to Qwen...`);
-            return await syncJcMatchesViaAI_qwenFallback(env, `${source} 0 matches`);
-        }
-        if (matches.length === 0) return { count: 0, source, error: 'AI returned empty matches' };
-
-        let inserted = 0, errors = 0;
-        for (const m of matches) {
-            try {
-                const odds = m.odds ? JSON.stringify(m.odds) : null;
-                let matchTime = m.matchTime || null;
-                if (!matchTime && m.sellEndTime) {
-                    const now = new Date();
-                    const date = now.toISOString().split('T')[0];
-                    matchTime = `${date}T${m.sellEndTime}:00+08:00`;
-                }
-                await env.DB.prepare(`
-                    INSERT OR IGNORE INTO lottery_jc_matches (home_team, away_team, match_time, league, score, status, odds, lottery_type, match_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `).bind(
-                    m.home, m.away, matchTime, m.league || '竞彩', '- -', '未开售',
-                    odds, '竞彩', m.matchNum || null
-                ).run();
-                inserted++;
-            } catch (e) {
-                errors++;
-                console.error(`AI JC insert error for ${m.home} vs ${m.away}:`, e.message);
-            }
-        }
-        return { count: matches.length, inserted, errors, source };
-    }
-};
-
-// AI 联网搜索兜底（500 / okooo HTML 抓取失败时调用）
-// 优先 MiniMax M3 web_search，Qwen 备选
-const aiWebSearch = async (env, query) => {
-    // 优先 M3
-    if (env.MINIMAX_API_KEY) {
-        try {
-            return await minimaxWebSearch(env, query);
-        } catch (e) {
-            console.warn('M3 web search failed, fallback to Qwen:', e.message);
-        }
-    }
-    // 备选 Qwen
-    if (env.QWEN_API_KEY) {
-        return await qwenWebSearch(env, query);
-    }
-    throw new Error('No AI search provider configured (need MINIMAX_API_KEY or QWEN_API_KEY)');
-};
-
-// AI 多 query 兜底（500 / okooo HTML 抓取失败时调用）
-const syncJcMatchesViaAI_qwenFallback = async (env, lastErr) => {
-    console.log('AI web search fallback, last error:', lastErr);
-    const now = new Date();
-    const tomorrow = new Date(now.getTime() + 86400000);
-    const queries = [
-        `${now.toISOString().split('T')[0]} 中国竞彩足球官方在售比赛完整列表，每场给编号（周二001/周三002格式）、主队、客队、联赛、开赛时间。返回JSON {"matches":[{"matchNum":"周二001","league":"欧冠","home":"主队","away":"客队","matchTime":"2026-07-21T20:00:00"}]}`,
-        `${tomorrow.toISOString().split('T')[0]} 中国竞彩足球官方在售比赛完整列表，每场给编号、主队、客队、联赛。返回JSON {"matches":[{"matchNum":"周三001","league":"欧冠","home":"主队","away":"客队","matchTime":"2026-07-22T20:00:00"}]}`,
-        `本周中国竞彩足球在售的所有比赛，列全部。返回JSON {"matches":[{"matchNum":"周二001","league":"欧冠","home":"主队","away":"客队","matchTime":"2026-07-21T20:00:00"}]}`
-    ];
-    const queryResults = await Promise.all(queries.map(async (q) => {
-        try { return await aiWebSearch(env, q); } catch (e) { return ''; }
-    }));
-    const allMatches = [];
-    const parseErrors = [];
-    for (const content of queryResults) {
-        if (!content) continue;
-        const jsonMatch = content.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) continue;
-        try {
-            const result = JSON.parse(jsonMatch[0]);
-            for (const m of (result.matches || [])) {
-                if (m && m.home && m.away) {
-                    const key = `${m.matchNum || ''}|${m.home}|${m.away}`;
-                    if (!allMatches.find(x => `${x.matchNum || ''}|${x.home}|${x.away}` === key)) {
-                        allMatches.push(m);
-                    }
-                }
-            }
-        } catch (e) {
-            parseErrors.push(e.message);
-        }
-    }
-    if (allMatches.length === 0) {
-        return { error: 'All AI queries returned no matches', parseErrors, source: 'ai-search', lastErr };
-    }
-    console.log(`AI search extracted ${allMatches.length} JC matches (deduped from ${queryResults.length} queries)`);
-
-    let inserted = 0, sqlErrors = 0;
-    for (const m of allMatches) {
-        try {
-            const odds = m.odds ? JSON.stringify(m.odds) : null;
-            let matchTime = m.matchTime || null;
-            if (!matchTime && m.sellEndTime) {
-                const date = new Date().toISOString().split('T')[0];
-                matchTime = `${date}T${m.sellEndTime}:00+08:00`;
-            }
-            await env.DB.prepare(`
-                INSERT OR IGNORE INTO lottery_jc_matches (home_team, away_team, match_time, league, score, status, odds, lottery_type, match_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `).bind(
-                m.home, m.away, matchTime, m.league || '竞彩', '- -', '未开售',
-                odds, '竞彩', m.matchNum || null
-            ).run();
-            inserted++;
-        } catch (e) {
-            sqlErrors++;
-            console.error(`AI JC insert error for ${m.home} vs ${m.away}:`, e.message);
-        }
-    }
-    return { count: allMatches.length, inserted, errors: sqlErrors, source: 'ai-search' };
-};
-
-// ===== AI 同步 JC 比分（live.500.com/wanchang.php）=====
-const syncJcScoresViaAI = async (env) => {
-    if (!env.QWEN_API_KEY) {
-        console.log('QWEN_API_KEY not configured, skip AI JC scores sync');
-        return { skipped: true, reason: 'no QWEN_API_KEY' };
-    }
-    console.log('AI syncing JC scores from live.500.com...');
-    let html;
-    try {
-        html = await fetchLive500Html();
-    } catch (e) {
-        console.error('fetchLive500Html failed:', e.message);
-        return { error: e.message };
-    }
-    let result;
-    try {
-        result = await aiExtractFromHtml(env, html,
-            '从 live.500.com 完赛列表页（wanchang.php）提取所有已完赛比赛的主队、客队和最终比分。每场只返回 home（主队）、away（客队）、score（比分如"1-1"，必须是 x-y 形式 x 和 y 都是数字）。不要包含未完赛的比赛。',
-            {
-                matches: [
-                    { home: '曼彻斯特联', away: '切尔西', score: '2-1' }
-                ]
-            }
-        );
-    } catch (e) {
-        console.error('aiExtractFromHtml failed for JC scores:', e.message);
-        return { error: e.message };
-    }
-    const liveMatches = (result.matches || []).filter(m => m && m.home && m.away && m.score && /\d+\s*-\s*\d+/.test(m.score));
-    console.log(`AI extracted ${liveMatches.length} finished JC matches`);
-    if (liveMatches.length === 0) return { liveCount: 0 };
-
-    const nowIso = new Date().toISOString();
-    for (const lm of liveMatches) lm.matchTime = nowIso;
-
-    // 待更新：score 缺失或 status != '已开奖'
-    const { results: candidates } = await env.DB.prepare(`
-        SELECT id, home_team, away_team, score, match_time
-        FROM lottery_jc_matches
-        WHERE (score IS NULL OR score = '' OR score = '0-0' OR score = '- -' OR status != '已开奖')
-          AND match_time IS NOT NULL
-          AND match_time >= datetime('now', '-7 days')
-          AND match_time <= datetime('now', '+12 hours')
-    `).all();
-    console.log(`Found ${candidates.length} lottery_jc_matches with missing scores`);
-
-    let updated = 0;
-    for (const liveMatch of liveMatches) {
-        const best = findBestMatch(liveMatch, candidates);
-        if (!best) continue;
-        try {
-            await env.DB.prepare(`
-                UPDATE lottery_jc_matches SET score = ?, status = '已开奖' WHERE id = ?
-            `).bind(liveMatch.score.replace(/\s+/g, ''), best.id).run();
-            updated++;
-        } catch (e) {
-            console.error(`AI JC score update error for id=${best.id}:`, e.message);
-        }
-    }
-    return { liveCount: liveMatches.length, candidates: candidates.length, updated };
-};
-
-// ===== AI 解析通用函数（Qwen3-max）=====
-const aiExtractFromHtml = async (env, html, instruction, schemaExample, model = 'qwen3-max') => {
-    // 截取前 30000 字符（约 50-60 场比赛），避免超出 token
-    const truncated = html.length > 30000 ? html.substring(0, 30000) + '\n<!-- truncated -->' : html;
-    const prompt = `${instruction}\n\n返回 JSON 格式示例：\n${JSON.stringify(schemaExample, null, 2)}\n\nHTML 内容（前 ${truncated.length} 字符）：\n${truncated}`;
-    const res = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${env.QWEN_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model,
-            messages: [
-                { role: 'system', content: '你是专业的中文体育数据提取助手，从 HTML 中提取结构化数据，严格按 JSON 返回。只返回 JSON，不要任何解释。' },
-                { role: 'user', content: prompt }
-            ],
-            response_format: { type: 'json_object' }
-        })
-    });
-    if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`Qwen API ${res.status}: ${err.substring(0, 200)}`);
-    }
-    const data = await res.json();
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) throw new Error('Qwen returned empty content');
-    return JSON.parse(content);
-};
-
-// 计算字符串相似度（最长公共子序列长度 / max(len(a), len(b))）
-const teamNameSim = (a, b) => {
-    if (!a || !b) return 0;
-    const s1 = a.toString();
-    const s2 = b.toString();
-    const m = s1.length, n = s2.length;
-    if (m === 0 || n === 0) return 0;
-    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-    for (let i = 1; i <= m; i++) {
-        for (let j = 1; j <= n; j++) {
-            dp[i][j] = s1[i - 1] === s2[j - 1]
-                ? dp[i - 1][j - 1] + 1
-                : Math.max(dp[i - 1][j], dp[i][j - 1]);
-        }
-    }
-    return dp[m][n] / Math.max(m, n);
-};
-
-// 在 juheMatches 中找最佳匹配（队名相似度 + 时间 ±3h）
-const findBestMatch = (liveMatch, juheMatches) => {
-    let best = null;
-    let bestScore = 0;
-    for (const m of juheMatches) {
-        if (!m.match_time) continue;
-        const homeSim = teamNameSim(m.home_team, liveMatch.home);
-        const awaySim = teamNameSim(m.away_team, liveMatch.away);
-        if (homeSim < 0.4 || awaySim < 0.4) continue;
-        // 队名相似度（两者都高才算），时间 ±3h 内
-        const teamScore = (homeSim + awaySim) / 2;
-        const timeDiff = Math.abs(new Date(m.match_time).getTime() - new Date(liveMatch.matchTime).getTime());
-        if (timeDiff > 3 * 3600 * 1000) continue;
-        // 时间越近分越高（最多 +0.2）
-        const timeScore = Math.max(0, 0.2 - timeDiff / (3 * 3600 * 1000) * 0.2);
-        const total = teamScore + timeScore;
-        if (total > bestScore) {
-            bestScore = total;
-            best = m;
-        }
-    }
-    return best;
-};
-
 const supplementScoresFromLive500 = async (env) => {
-    console.log('Suplementing scores from live.500.com...');
+    console.log('Supplementing scores from live.500.com...');
+    
     const liveMatches = await fetchLive500Matches();
+    
     if (liveMatches.length === 0) {
         console.log('No matches found from live.500.com');
         return;
     }
-    // 给 live match 补上时间字段（live.500.com 的 score 行附近有比赛时间，先用今天 0:00 兜底，按 match_time 接近度匹配时会偏离）
-    // 由于 wanchang.php 列出的是已完赛比赛，给每条加个当前时间戳作为粗略时间窗中心
-    const nowTs = Date.now();
-    for (const lm of liveMatches) lm.matchTime = new Date(nowTs).toISOString();
-
-    // 1. juhe_matches: score 为空或 '0-0' 兜底
+    
     const { results: juheMatches } = await env.DB.prepare(`
-        SELECT id, home_team, away_team, score, match_time
-        FROM juhe_matches
-        WHERE score IS NULL OR score = '' OR score = '0-0'
-          AND match_time IS NOT NULL
-          AND match_time >= datetime('now', '-7 days')
-          AND match_time <= datetime('now', '+12 hours')
+        SELECT id, home_team, away_team, score, match_time 
+        FROM juhe_matches 
+        WHERE score IS NULL OR score = '' OR score = '- -' OR score = '- - -'
     `).all();
-    console.log(`Found ${juheMatches.length} juhe_matches with missing scores`);
-
-    let juheUpdated = 0;
-    for (const liveMatch of liveMatches) {
-        const best = findBestMatch(liveMatch, juheMatches);
-        if (!best) continue;
-        try {
-            await env.DB.prepare(`
-                UPDATE juhe_matches SET score = ?, status = '完赛'
-                WHERE id = ?
-            `).bind(liveMatch.score, best.id).run();
-            juheUpdated++;
-        } catch (e) {
-            console.error(`live500 juhe update error for id=${best.id}:`, e.message);
-        }
-    }
-    console.log(`Supplemented ${juheUpdated} juhe_matches from live.500.com`);
-
-    // 2. lottery_jc_matches + lottery_bd_matches: score 为空或 status != '已开奖'
-    for (const table of ['lottery_jc_matches', 'lottery_bd_matches']) {
-        const { results: lotMatches } = await env.DB.prepare(`
-            SELECT id, home_team, away_team, score, status, match_time
-            FROM ${table}
-            WHERE (score IS NULL OR score = '' OR score = '0-0' OR status != '已开奖')
-              AND match_time IS NOT NULL
-              AND match_time >= datetime('now', '-7 days')
-              AND match_time <= datetime('now', '+12 hours')
-        `).all();
-        console.log(`Found ${lotMatches.length} ${table} with missing scores`);
-        let lotUpdated = 0;
+    
+    console.log(`Found ${juheMatches.length} matches with missing scores`);
+    
+    let supplementedCount = 0;
+    
+    for (const match of juheMatches) {
         for (const liveMatch of liveMatches) {
-            const best = findBestMatch(liveMatch, lotMatches);
-            if (!best) continue;
-            try {
+            const homeMatch = match.home_team.includes(liveMatch.home) || liveMatch.home.includes(match.home_team);
+            const awayMatch = match.away_team.includes(liveMatch.away) || liveMatch.away.includes(match.away_team);
+            
+            if (homeMatch && awayMatch && liveMatch.score && liveMatch.score.includes('-')) {
                 await env.DB.prepare(`
-                    UPDATE ${table} SET score = ?, status = '已开奖'
+                    UPDATE juhe_matches 
+                    SET score = ? 
                     WHERE id = ?
-                `).bind(liveMatch.score, best.id).run();
-                lotUpdated++;
-            } catch (e) {
-                console.error(`live500 ${table} update error for id=${best.id}:`, e.message);
+                `).bind(liveMatch.score, match.id).run();
+                
+                console.log(`Supplemented score for ${match.home_team} vs ${match.away_team}: ${liveMatch.score}`);
+                supplementedCount++;
+                break;
             }
         }
-        console.log(`Supplemented ${lotUpdated} ${table} from live.500.com`);
     }
+    
+    console.log(`Supplemented ${supplementedCount} scores from live.500.com`);
 };
 
 const getRenjiuScore = async (env, homeTeam, awayTeam, matchTime) => {
@@ -2196,14 +1960,11 @@ export default {
         console.log(`Cron job triggered: ${cron}`);
 
         if (cron === '0 */4 * * *') {
-            console.log('Running 4-hour sync: Juhe + AI JC list + AI JC scores + Firo BD + Firo match-results + odds + live500 supplement...');
+            console.log('Running 4-hour sync: Juhe matches + Firo lottery (BD/JC) + match results + odds...');
             await syncJuheMatches(env);
-            await syncJcMatchesViaAI(env);
-            await syncJcScoresViaAI(env);
             await syncFiroLottery(env);
             await syncFiroMatchResults(env);
             await syncOddsFromFiro(env);
-            await supplementScoresFromLive500(env);
             console.log('4-hour sync completed.');
         } else {
             console.log('Running default sync...');
@@ -3427,48 +3188,6 @@ export default {
             }
         }
 
-        // AI 解析 500.com/jczq/ 获取 JC 名单
-        if (url.pathname === '/api/ai/jc/list' && request.method === 'POST') {
-            const secret = request.headers.get('x-api-secret');
-            if (secret !== env.API_SECRET) {
-                return new Response(JSON.stringify({ error: 'Forbidden' }), {
-                    status: 403, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                });
-            }
-            try {
-                const result = await syncJcMatchesViaAI(env);
-                return new Response(JSON.stringify({ message: 'AI JC list sync done', result }), {
-                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                });
-            } catch (e) {
-                console.error('AI JC list sync error:', e);
-                return new Response(JSON.stringify({ error: e.message }), {
-                    status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                });
-            }
-        }
-
-        // AI 解析 live.500.com/wanchang.php 更新 JC 比分
-        if (url.pathname === '/api/ai/jc/scores' && request.method === 'POST') {
-            const secret = request.headers.get('x-api-secret');
-            if (secret !== env.API_SECRET) {
-                return new Response(JSON.stringify({ error: 'Forbidden' }), {
-                    status: 403, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                });
-            }
-            try {
-                const result = await syncJcScoresViaAI(env);
-                return new Response(JSON.stringify({ message: 'AI JC scores sync done', result }), {
-                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                });
-            } catch (e) {
-                console.error('AI JC scores sync error:', e);
-                return new Response(JSON.stringify({ error: e.message }), {
-                    status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                });
-            }
-        }
-
         if (url.pathname === '/api/firo/bd') {
             try {
                 const timestamp = Date.now().toString();
@@ -3867,6 +3586,34 @@ export default {
             } catch (e) {
                 console.error('Odds sync error:', e);
                 return new Response(JSON.stringify({ error: 'Odds sync failed', details: e.message }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+
+        // ===== Vercel AI SDK agent：M3 多步 tool_use =====
+        if (url.pathname === '/api/ai/jc/agent' && request.method === 'POST') {
+            const secret = request.headers.get('x-api-secret');
+            if (secret !== env.API_SECRET) {
+                return new Response(JSON.stringify({ error: 'Forbidden' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            try {
+                const startMs = Date.now();
+                const result = await syncJcMatchesViaM3Agent(env);
+                const elapsed = Date.now() - startMs;
+                return new Response(JSON.stringify({
+                    message: 'M3 agent JC list sync done',
+                    elapsed_ms: elapsed,
+                    result
+                }), {
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch (e) {
+                return new Response(JSON.stringify({ error: e.message, stack: e.stack?.substring(0, 500) }), {
                     status: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
