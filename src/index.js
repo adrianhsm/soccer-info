@@ -3717,6 +3717,25 @@ export default {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
             }
+            // debug 模式：查询 D1 lottery_jc_matches
+            if (url.searchParams.get('debug') === 'db') {
+                try {
+                    const onlyFuture = url.searchParams.get('future') === '1';
+                    const onlyWithOdds = url.searchParams.get('odds') === '1';
+                    let sql = 'SELECT id, home_team, away_team, league, match_time, match_id, odds, length(odds) as odds_len FROM lottery_jc_matches';
+                    const conds = [];
+                    if (onlyFuture) conds.push("match_time > datetime('now')");
+                    if (onlyWithOdds) conds.push("odds IS NOT NULL");
+                    if (conds.length > 0) sql += ' WHERE ' + conds.join(' AND ');
+                    sql += ' ORDER BY id DESC LIMIT 10';
+                    const rows = await env.DB.prepare(sql).all();
+                    return new Response(JSON.stringify(rows, null, 2), {
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                } catch (e) {
+                    return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+                }
+            }
             try {
                 const startMs = Date.now();
                 const result = await syncJcMatchesViaM3Agent(env);
