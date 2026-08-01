@@ -195,7 +195,7 @@ const syncJcMatchesViaM3Agent = async (env) => {
     const now = new Date();
     const today = now.toISOString().split('T')[0];
     const tomorrow = new Date(now.getTime() + 86400000).toISOString().split('T')[0];
-    console.log(`[M3 Agent] start, target: ${today} ~ ${tomorrow}`);
+    console.log(`[M3 Agent] start, target: ${today} ~ ${tomorrow}, api_host=${env.MINIMAX_API_HOST || 'default'}, has_key=${!!env.MINIMAX_API_KEY}, key_len=${(env.MINIMAX_API_KEY||'').length}`);
 
     const messages = [
         {
@@ -235,14 +235,17 @@ const syncJcMatchesViaM3Agent = async (env) => {
         step++;
         let resp;
         try {
+            console.log(`[M3 Agent] step ${step} calling m3ChatCompletion...`);
             resp = await m3ChatCompletion(env, messages, M3_TOOLS_SCHEMA);
+            console.log(`[M3 Agent] step ${step} got resp keys=${Object.keys(resp || {}).join(',')}`);
         } catch (e) {
-            console.error(`[M3 Agent] step ${step} API error:`, e.message);
-            return { error: `M3 chat failed: ${e.message}`, step, steps: stepsLog };
+            console.error(`[M3 Agent] step ${step} API error:`, e.message, e.stack?.substring(0, 300));
+            return { error: `M3 chat failed: ${e.message}`, stack: e.stack?.substring(0, 500), step, steps: stepsLog };
         }
         const choice = resp.choices?.[0];
         if (!choice) {
-            return { error: 'M3 returned no choice', resp: JSON.stringify(resp).substring(0, 500) };
+            console.error(`[M3 Agent] no choice, full resp:`, JSON.stringify(resp).substring(0, 1000));
+            return { error: 'M3 returned no choice', resp: JSON.stringify(resp).substring(0, 1000), step, steps: stepsLog };
         }
         const msg = choice.message || {};
         const toolCalls = msg.tool_calls || [];
@@ -3702,7 +3705,7 @@ export default {
         }
 
         // ===== Vercel AI SDK agent：M3 多步 tool_use =====
-        if (url.pathname === '/api/ai/jc/agent' && request.method === 'POST') {
+        if (url.pathname === '/api/ai/jc/agent' && (request.method === 'POST' || request.method === 'GET')) {
             const secret = request.headers.get('x-api-secret');
             if (secret !== env.API_SECRET) {
                 return new Response(JSON.stringify({ error: 'Forbidden' }), {
